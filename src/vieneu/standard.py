@@ -8,7 +8,7 @@ import logging
 from .base import BaseVieneuTTS
 from .utils import extract_speech_ids, _linear_overlap_add, normalize_device
 from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch, normalize_to_chunks
-from vieneu_utils.core_utils import join_audio_chunks
+from vieneu_utils.core_utils import join_audio_chunks, trust_remote_code_enabled
 
 logger = logging.getLogger("Vieneu.Standard")
 
@@ -118,7 +118,11 @@ class VieNeuTTS(BaseVieneuTTS):
             self._is_quantized_model = True
         else:
             from transformers import AutoTokenizer, AutoModelForCausalLM
-            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, token=hf_token, trust_remote_code=True)
+            # The official checkpoints are stock Qwen2/Qwen3 and need no repo code;
+            # `backbone_repo` may come from the Web UI's "Custom Model" box, so a
+            # repo's own Python only runs with VIENEU_TRUST_REMOTE_CODE=1.
+            trust_code = trust_remote_code_enabled()
+            self.tokenizer = AutoTokenizer.from_pretrained(backbone_repo, token=hf_token, trust_remote_code=trust_code)
 
             # Configure tokenizer for batching
             self.tokenizer.padding_side = "left"
@@ -129,7 +133,7 @@ class VieNeuTTS(BaseVieneuTTS):
             self.backbone = AutoModelForCausalLM.from_pretrained(
                 backbone_repo, 
                 token=hf_token, 
-                trust_remote_code=True
+                trust_remote_code=trust_code
             ).to(torch.device(backbone_device))
 
             # Optional torch.compile for non-Windows/non-Mac platforms if desired

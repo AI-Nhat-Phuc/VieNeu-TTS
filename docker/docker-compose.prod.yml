@@ -35,6 +35,7 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
+      - HOST=0.0.0.0   # the server defaults to loopback; the published port needs all interfaces
       - PORT=8000
       - VIENEU_MAX_STREAMS=${VIENEU_MAX_STREAMS:-16}
       - VIENEU_QUEUE=${VIENEU_QUEUE:-16}

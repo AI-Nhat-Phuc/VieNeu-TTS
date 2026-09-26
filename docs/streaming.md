@@ -62,9 +62,9 @@ Environment:
 | `VIENEU_MAX_STREAMS` | GPU 16 · CPU 1 (int8: 2) | Streams served at once. On GPU this is the continuous-batch size — **match it to your real load** (see below) |
 | `VIENEU_QUEUE` | = `MAX_STREAMS` | Requests allowed to wait for a slot; beyond that → immediate `429` |
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Max seconds in the queue; then `429` |
-| `VIENEU_API_KEY` | (empty) | If set, requires `Authorization: Bearer <key>` |
+| `VIENEU_API_KEY` | (empty) | If set, requires `Authorization: Bearer <key>`. Unset on a non-loopback `HOST` → a warning at start-up |
 | `VIENEU_WATERMARK` | 1 | Perth audio watermark, per chunk |
-| `HOST` / `PORT` | `0.0.0.0` / 8000 | |
+| `HOST` / `PORT` | `127.0.0.1` / 8000 | `HOST=0.0.0.0` to serve other machines (the Docker profiles set it) — together with `VIENEU_API_KEY` |
 
 The server runs **one worker** (`uvicorn workers=1`): the model and the scheduler live in the process; the GPU serves many streams by batching inside, not by forking. Scale out by running several containers, one GPU each.
 
@@ -87,8 +87,8 @@ JSON body — OpenAI's fields plus a few extras:
 | `stream_format` | `audio` | `audio`: raw bytes, chunked transfer · `sse`: Server-Sent Events (below) |
 | `sample_rate` | 48000 | 48000 (native) · 24000 (OpenAI's `pcm` rate) · 16000 · 8000 — resampled per chunk with soxr, no added latency |
 | `speed`, `instructions` | — | Accepted for compatibility, **ignored** (`X-VieNeu-Ignored` header says so) |
-| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.8 / 25 / 0.95 / 1.2 | Sampling |
-| `max_chars` | 256 | Max text chunk length |
+| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.8 / 25 / 0.95 / 1.2 | Sampling; allowed 0–2 / 1–1024 / (0, 1] / 1–2, anything else (or NaN) → `400` |
+| `max_chars` | 256 | Max text chunk length, 64–512 |
 
 Response: `200` with `Transfer-Encoding: chunked`; headers `X-Request-Id`, `X-Sample-Rate`. Errors use OpenAI's shape `{"error": {"message", "type", "code"}}`: `400` bad parameter, `401` bad key, `429` no slot (with `Retry-After`).
 
@@ -108,8 +108,8 @@ With `response_format=wav` + `sse`, the first event is the WAV header (base64).
 |---|---|
 | `GET /v1/models` | Model, `sample_rate`, `backend`, `max_streams`, supported formats |
 | `GET /v1/voices` | Presets (`id`, `name`, `description`, `gender`) |
-| `POST /v1/voices` | multipart `name`, `file` (3–8 s clip), `denoise` — clones a voice, kept in process memory |
-| `GET /health` | `active` (playing), `waiting` (queued), `max_streams` |
+| `POST /v1/voices` | multipart `name`, `file` (3–8 s clip), `denoise` — clones a voice, kept in process memory. The name of a built-in voice or alias → `409` |
+| `GET /health` | `active` (playing), `waiting` (queued), `max_streams`. `503` once the GPU stream scheduler has died (it does not recover — the Docker healthcheck restarts the container) |
 
 ### Clients
 

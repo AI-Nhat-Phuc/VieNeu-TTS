@@ -30,7 +30,11 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     speed            accepted for compatibility, ignored (header X-VieNeu-Ignored)
     sample_rate      48000 (native) | 24000 (OpenAI's pcm rate) | 16000 | 8000 —
                      resampled on the fly (soxr), per chunk, no extra latency
-    temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras
+    temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras,
+                     range-checked (out of range → 400): 0-2 / 1-1024 / (0, 1] / 1-2 / 64-512
+
+POST /v1/voices refuses (409) the name of a built-in voice or alias, so a client
+cannot swap out a voice other clients rely on (e.g. the default one).
 
 Concurrency: GPU serves ``VIENEU_MAX_STREAMS`` streams at once (continuous
 batching, default 16); CPU serves one (fp32) or two (int8) — the ONNX engine
@@ -42,12 +46,16 @@ Environment:
     VIENEU_BACKEND=auto|onnx|pytorch   VIENEU_DEVICE=auto|cuda|cpu
     VIENEU_PRECISION=fp32|int8 (CPU)   VIENEU_ONNX_DIR=... (local ONNX export)
     VIENEU_MAX_STREAMS=16 (GPU)        VIENEU_QUEUE=16   VIENEU_QUEUE_TIMEOUT=10
-    VIENEU_API_KEY=...  (Bearer auth; unset = open)
-    VIENEU_WATERMARK=1                 HOST=0.0.0.0  PORT=8000
+    VIENEU_API_KEY=...  (Bearer auth; unset = open — logged as a warning when
+                        HOST is not a loopback address)
+    VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
+                                       (HOST=0.0.0.0 to serve other machines; the
+                                       Docker profiles set it)
 """
 from __future__ import annotations
 
 import base64
+import hmac
 import io
 import json
 import logging
@@ -58,11 +66,13 @@ import threading
 import time
 import uuid
 import wave
+import weakref
 from typing import Any, Iterator, Optional
 
 import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -99,6 +109,9 @@ class Engine:
         t = time.perf_counter()
         self.tts = Vieneu(mode="v3turbo", **kw)
         self.backend = self.tts.backend
+        # The voices and aliases that exist before any client enrolls one;
+        # POST /v1/voices may not replace them.
+        self.builtin_voices = frozenset(self.tts._preset_voices) | frozenset(self.tts._voice_aliases)
         self.watermark = os.environ.get("VIENEU_WATERMARK", "1") != "0"
         # GPU: the scheduler batches every stream. CPU: the ONNX engine interleaves
         # calls frame by frame, but they share the cores — measured on a 6-core
@@ -143,6 +156,11 @@ class Engine:
             self.active -= 1
         self._gate.release()
 
+    def stream_error(self) -> Optional[BaseException]:
+        """Why the GPU stream scheduler died, or None. A dead scheduler refuses
+        every request until the process restarts."""
+        return getattr(self.sched, "error", None) if self.sched is not None else None
+
     def voices(self) -> list:
         out = []
         for name, v in self.tts._preset_voices.items():
@@ -150,6 +168,23 @@ class Engine:
                         "gender": v.get("gender", ""), "featured": v.get("featured"),
                         "aliases": list(v.get("aliases") or [])})
         return out
+
+
+class _Slot:
+    """One ``Engine`` stream slot, released exactly once: by the stream's own
+    ``finally``, or — when the body is never iterated because the client left
+    while queued — when the dropped body is garbage-collected."""
+
+    def __init__(self, eng: Engine):
+        self._eng = eng
+        self._lock = threading.Lock()
+        self._held = True
+
+    def release(self) -> None:
+        with self._lock:
+            held, self._held = self._held, False
+        if held:
+            self._eng.release()
 
 
 ENGINE: Optional[Engine] = None
@@ -166,7 +201,7 @@ def engine() -> Engine:
 
 def _auth(authorization: Optional[str] = Header(default=None)) -> None:
     key = os.environ.get("VIENEU_API_KEY")
-    if key and authorization != f"Bearer {key}":
+    if key and not hmac.compare_digest((authorization or "").encode(), f"Bearer {key}".encode()):
         raise HTTPException(401, "invalid api key")
 
 
@@ -181,6 +216,17 @@ app = FastAPI(title="VieNeu-TTS speech API", version="1.0")
 @app.exception_handler(HTTPException)
 async def _http_exc(_req: Request, exc: HTTPException):
     return _error(exc.status_code, str(exc.detail), headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def _invalid_request(_req: Request, exc: RequestValidationError):
+    # Field and reason only: FastAPI's default echoes the rejected value, and a
+    # NaN (which json.loads accepts) cannot be encoded back — the 422 became a 500.
+    errs = exc.errors()
+    first = errs[0] if errs else {}
+    field = ".".join(str(p) for p in first.get("loc", ()) if p not in ("body", "query", "header"))
+    msg = first.get("msg", "invalid request")
+    return _error(400, f"{field}: {msg}" if field else msg)
 
 
 @app.on_event("startup")
@@ -235,14 +281,16 @@ class SpeechRequest(BaseModel):
     speed: Optional[float] = None
     instructions: Optional[str] = None
     sample_rate: int = SAMPLE_RATE
-    temperature: float = 0.8
-    top_k: int = 25
-    top_p: float = 0.95
-    repetition_penalty: float = 1.2
-    max_chars: int = 256
+    # Bounded so one request cannot break the GPU scheduler every stream shares:
+    # e.g. a huge top_k overflowed its int64 slot and NaN reached multinomial.
+    temperature: float = Field(0.8, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_k: int = Field(25, ge=1, le=1024)   # 1024 = the codec's vocabulary
+    top_p: float = Field(0.95, gt=0.0, le=1.0, allow_inf_nan=False)
+    repetition_penalty: float = Field(1.2, ge=1.0, le=2.0, allow_inf_nan=False)
+    max_chars: int = Field(256, ge=64, le=512)
 
 
-def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str) -> Iterator[np.ndarray]:
+def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> Iterator[np.ndarray]:
     """float32 chunks at ``req.sample_rate``; logs TTFA / RTF; holds one stream slot."""
     t0 = time.perf_counter()
     first = None
@@ -266,7 +314,7 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str) -> Iterator[np.nda
         if len(tail):
             yield tail
     finally:
-        eng.release()
+        slot.release()
         total = time.perf_counter() - t0
         audio_s = emitted / SAMPLE_RATE
         log.info("%s done: ttfa=%s total=%.2fs audio=%.2fs rtf=%s active=%d", rid,
@@ -306,9 +354,16 @@ def speech(req: SpeechRequest):
         raise HTTPException(400, f"sample_rate must be one of {RATES}")
     if req.voice and eng.tts.resolve_voice_name(req.voice) is None:
         raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
+    if eng.stream_error() is not None:
+        # Say so now: once the 200 headers are out, a failure only truncates the body.
+        raise HTTPException(503, "speech engine is down; restart the server (see /health)")
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     eng.acquire()   # 429 if the server is full; released when the stream ends
-    chunks = _speech_chunks(eng, req, rid)
+    slot = _Slot(eng)
+    chunks = _speech_chunks(eng, req, rid, slot)
+    # A generator that never starts never runs its finally: if the client is gone
+    # before the body is read, the slot is freed when the body is dropped.
+    weakref.finalize(chunks, slot.release)
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
     ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
     if ignored:
@@ -360,6 +415,9 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
         raise HTTPException(400, "voice name: 1-64 letters, digits, spaces, '.', '-' or '_'")
     if not _VOICE_NAME.fullmatch(description or "x"):
         raise HTTPException(400, "description: 1-64 letters, digits, spaces, '.', '-' or '_'")
+    if name in eng.builtin_voices:
+        # add_voice would replace it for every client, including the default voice.
+        raise HTTPException(409, f"'{name}' is a built-in voice; choose another name")
     # The suffix only picks the decoder; it is mapped to a constant, never taken from the client.
     ext = _CLIP_EXTS.get(os.path.splitext(file.filename or "")[1].lower(), ".wav")
     data = file.file.read(_MAX_CLIP_BYTES + 1)
@@ -382,13 +440,23 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
 @app.get("/health")
 def health():
     eng = engine()
-    return {"status": "ok", "backend": eng.backend, "max_streams": eng.max_streams,
+    body = {"status": "ok", "backend": eng.backend, "max_streams": eng.max_streams,
             "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE}
+    err = eng.stream_error()
+    if err is not None:
+        # 503 so a container healthcheck restarts us: the scheduler does not recover.
+        return JSONResponse({**body, "status": "error", "error": f"stream scheduler is down: {err!r}"},
+                            status_code=503)
+    return body
 
 
 def main() -> None:
-    host = os.environ.get("HOST", "0.0.0.0")
+    # Loopback unless told otherwise: the API is open when VIENEU_API_KEY is unset.
+    host = os.environ.get("HOST", "127.0.0.1")
     port = _env_int("PORT", 8000)
+    if host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("VIENEU_API_KEY"):
+        log.warning("⚠️ listening on %s:%d without VIENEU_API_KEY: anyone who can reach this port "
+                    "can use the API and enroll voices", host, port)
     # One worker: the model (and on GPU the scheduler) is process-local.
     uvicorn.run(app, host=host, port=port, workers=1, log_level="info")
 

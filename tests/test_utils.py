@@ -10,6 +10,8 @@ from vieneu_utils.core_utils import (
     trim_and_fade,
     pause_pad_samples,
     V3_GAP_SILENCE,
+    check_sampling,
+    trust_remote_code_enabled,
 )
 
 # --- Text Utils Tests ---
@@ -432,3 +434,28 @@ def test_strip_encoder_pad_frame_drops_only_a_trailing_455():
     assert strip_encoder_pad_frame(np.array([[10, 1], [455, 2], [20, 3]])).shape[0] == 3
     assert strip_encoder_pad_frame(np.array([[455, 1]])).shape[0] == 1   # never empty a reference
     assert strip_encoder_pad_frame(None) is None
+
+
+# --- Guards for the shared GPU path / remote code ---
+
+@pytest.mark.parametrize("bad", [
+    dict(temperature=float("nan")), dict(temperature=float("inf")), dict(temperature=-0.1),
+    dict(top_p=float("nan")), dict(repetition_penalty=0.0), dict(repetition_penalty=float("nan")),
+    dict(top_k="many"), dict(top_k=float("inf")),
+])
+def test_check_sampling_rejects_values_that_poison_the_gpu(bad):
+    args = dict(temperature=0.8, top_k=25, top_p=0.95, repetition_penalty=1.2)
+    args.update(bad)
+    with pytest.raises(ValueError):
+        check_sampling(**args)
+
+
+def test_check_sampling_normalizes_types():
+    assert check_sampling(0, 25.0, 0.9, 1) == (0.0, 25, 0.9, 1.0)   # temperature 0 = greedy
+
+
+def test_trust_remote_code_is_opt_in(monkeypatch):
+    monkeypatch.delenv("VIENEU_TRUST_REMOTE_CODE", raising=False)
+    assert trust_remote_code_enabled() is False
+    monkeypatch.setenv("VIENEU_TRUST_REMOTE_CODE", "1")
+    assert trust_remote_code_enabled() is True

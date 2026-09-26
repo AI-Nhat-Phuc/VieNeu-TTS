@@ -112,3 +112,19 @@ def test_base_encode_reference_device(mock_tts_instance):
             mock_tts_instance.encode_reference("dummy.wav")
             # Ensure codec was called
             mock_tts_instance.codec.encode_code.assert_called()
+
+
+@pytest.mark.parametrize("env, expected", [(None, False), ("1", True)])
+def test_repo_code_runs_only_when_opted_in(monkeypatch, env, expected):
+    # The Web UI's "Custom Model" box feeds any repo id here.
+    if env is None:
+        monkeypatch.delenv("VIENEU_TRUST_REMOTE_CODE", raising=False)
+    else:
+        monkeypatch.setenv("VIENEU_TRUST_REMOTE_CODE", env)
+    transformers = MagicMock()
+    tts = VieNeuTTS.__new__(VieNeuTTS)
+    tts._is_quantized_model, tts.codec = False, None   # what __init__ sets before loading
+    with patch.dict(sys.modules, {"transformers": transformers, "torch": MagicMock()}):
+        tts._load_backbone("someone/any-repo", "cpu", None, None)
+    for loader in (transformers.AutoTokenizer, transformers.AutoModelForCausalLM):
+        assert loader.from_pretrained.call_args.kwargs["trust_remote_code"] is expected
