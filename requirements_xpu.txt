@@ -60,7 +60,7 @@ language-tags==1.2.0
 lazy-loader==0.4
 librosa==0.11.0
 llvmlite==0.45.1
-lmdeploy==0.11.0
+lmdeploy==0.16.0
 local-attention==1.11.2
 lxml==6.0.2
 markdown-it-py==4.0.0
@@ -156,7 +156,7 @@ uvicorn==0.38.0
 vector-quantize-pytorch==1.17.8
 wcwidth==0.2.14
 websockets==15.0.1
-xgrammar==0.1.28
+xgrammar==0.1.33
 xxhash==3.6.0
 yapf==0.43.0
 yarl==1.22.0
