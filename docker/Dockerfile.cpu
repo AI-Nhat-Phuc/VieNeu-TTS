@@ -31,5 +31,5 @@ COPY --chown=app:app config.yaml ./
 COPY --chown=app:app examples/audio_ref/ examples/audio_ref/
 
 USER app
-EXPOSE 7860
-CMD ["python", "apps/gradio_main.py"]
+EXPOSE 8000
+CMD ["python", "-m", "apps.openai_speech"]
