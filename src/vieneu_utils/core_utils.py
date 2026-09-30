@@ -1,5 +1,6 @@
 import re
 import os
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -762,6 +763,38 @@ def env_bool(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def trust_remote_code_enabled() -> bool:
+    """``trust_remote_code`` for user-supplied model repos (``VIENEU_TRUST_REMOTE_CODE=1``).
+
+    Off by default: the v1/v2 checkpoints are stock Qwen2/Qwen3 models that need no
+    custom code, while a repo id typed into the Web UI can point anywhere — with
+    remote code on, loading it runs that repo's Python on this machine.
+    """
+    return env_bool("VIENEU_TRUST_REMOTE_CODE", default=False)
+
+
+def check_sampling(temperature, top_k, top_p, repetition_penalty) -> Tuple[float, int, float, float]:
+    """Reject sampling settings that would break a shared GPU graph.
+
+    A NaN temperature or a zero penalty turns the logits into NaN/inf, and
+    ``torch.multinomial`` on CUDA then fails with a device-side assert that
+    poisons the CUDA context for every request in the process. Returns the
+    values as ``(float, int, float, float)``; raises ``ValueError`` otherwise.
+    ``temperature`` 0 is greedy and ``top_k`` <= 0 disables top-k.
+    """
+    try:
+        t, k, p, rp = float(temperature), int(top_k), float(top_p), float(repetition_penalty)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError(f"invalid sampling settings: {e}") from None
+    if not (math.isfinite(t) and t >= 0):
+        raise ValueError(f"temperature must be a finite number >= 0, got {temperature!r}")
+    if not math.isfinite(p):
+        raise ValueError(f"top_p must be a finite number, got {top_p!r}")
+    if not (math.isfinite(rp) and 1e-3 <= rp <= 1e3):
+        raise ValueError(f"repetition_penalty must be between 0.001 and 1000, got {repetition_penalty!r}")
+    return t, k, p, rp
 
 # ── Babble guard (chunk rất ngắn "nói thêm") ─────────────────────────────────
 # Chunk 1-3 tiếng thỉnh thoảng bắn trượt stop token rồi bịa thêm một từ cho

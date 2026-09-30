@@ -72,6 +72,7 @@ services:
     environment:
       - HF_HOME=${HF_HOME:-/home/app/.cache/huggingface}
       - PYTHONUNBUFFERED=1
+      - HOST=0.0.0.0   # the server defaults to loopback; the published port needs all interfaces
       - PORT=8000
       - VIENEU_MAX_STREAMS=${VIENEU_MAX_STREAMS:-16}
       - VIENEU_QUEUE=${VIENEU_QUEUE:-16}
@@ -110,6 +111,7 @@ services:
     environment:
       - HF_HOME=${HF_HOME:-/home/app/.cache/huggingface}
       - PYTHONUNBUFFERED=1
+      - HOST=0.0.0.0   # the server defaults to loopback; the published port needs all interfaces
       - PORT=8000
       - VIENEU_BACKEND=onnx
       - VIENEU_PRECISION=${VIENEU_PRECISION:-fp32}   # int8: nhanh ~2x, cần CPU có VNNI

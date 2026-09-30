@@ -62,9 +62,9 @@ Biến môi trường:
 | `VIENEU_MAX_STREAMS` | GPU 16 · CPU 1 (int8: 2) | Số luồng phục vụ đồng thời. GPU: kích thước batch liên tục — **đặt sát tải thật** (xem bên dưới) |
 | `VIENEU_QUEUE` | = `MAX_STREAMS` | Số request được xếp hàng chờ slot; quá → `429` ngay |
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Giây chờ tối đa trong hàng; hết → `429` |
-| `VIENEU_API_KEY` | (trống) | Nếu đặt, yêu cầu `Authorization: Bearer <key>` |
+| `VIENEU_API_KEY` | (trống) | Nếu đặt, yêu cầu `Authorization: Bearer <key>`. Để trống mà `HOST` không phải loopback → cảnh báo lúc khởi động |
 | `VIENEU_WATERMARK` | 1 | Đóng watermark âm thanh (Perth) từng chunk |
-| `HOST` / `PORT` | `0.0.0.0` / 8000 | |
+| `HOST` / `PORT` | `127.0.0.1` / 8000 | `HOST=0.0.0.0` để máy khác gọi được (các profile Docker đã đặt sẵn) — kèm `VIENEU_API_KEY` |
 
 Server chỉ chạy **một worker** (`uvicorn workers=1`): model và scheduler nằm trong tiến trình; GPU phục vụ nhiều luồng bằng batching bên trong chứ không bằng nhiều tiến trình. Muốn scale ngang thì chạy nhiều container, mỗi container một GPU.
 
@@ -87,8 +87,8 @@ Body JSON — các trường của OpenAI cộng vài trường mở rộng:
 | `stream_format` | `audio` | `audio`: body là bytes theo chunked transfer · `sse`: Server-Sent Events (bên dưới) |
 | `sample_rate` | 48000 | 48000 (gốc) · 24000 (chuẩn `pcm` của OpenAI) · 16000 · 8000 — resample từng chunk bằng soxr, không thêm trễ |
 | `speed`, `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết) |
-| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,8 / 25 / 0,95 / 1,2 | Sampling |
-| `max_chars` | 256 | Độ dài chunk văn bản tối đa |
+| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,8 / 25 / 0,95 / 1,2 | Sampling; cho phép 0–2 / 1–1024 / (0, 1] / 1–2, ngoài khoảng (hoặc NaN) → `400` |
+| `max_chars` | 256 | Độ dài chunk văn bản tối đa, 64–512 |
 
 Response: `200` với `Transfer-Encoding: chunked`; header `X-Request-Id`, `X-Sample-Rate`. Lỗi trả đúng dạng OpenAI `{"error": {"message", "type", "code"}}`: `400` tham số sai, `401` sai key, `429` hết slot (kèm `Retry-After`).
 
@@ -108,8 +108,8 @@ Với `response_format=wav` + `sse`, event đầu tiên là header WAV (base64).
 |---|---|
 | `GET /v1/models` | Model, `sample_rate`, `backend`, `max_streams`, định dạng hỗ trợ |
 | `GET /v1/voices` | Danh sách preset (`id`, `name`, `description`, `gender`) |
-| `POST /v1/voices` | multipart `name`, `file` (clip 3–8 s), `denoise` — nhân bản giọng, giữ trong bộ nhớ tiến trình |
-| `GET /health` | `active` (đang phát), `waiting` (đang xếp hàng), `max_streams` |
+| `POST /v1/voices` | multipart `name`, `file` (clip 3–8 s), `denoise` — nhân bản giọng, giữ trong bộ nhớ tiến trình. Trùng tên giọng có sẵn hoặc alias → `409` |
+| `GET /health` | `active` (đang phát), `waiting` (đang xếp hàng), `max_streams`. `503` khi scheduler streaming GPU đã chết (không tự hồi phục — healthcheck của Docker sẽ restart container) |
 
 ### Client
 

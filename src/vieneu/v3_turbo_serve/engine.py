@@ -16,6 +16,8 @@ import logging
 import math
 import os
 import re
+import threading
+from collections import OrderedDict
 from typing import List, Optional
 
 import numpy as np
@@ -44,7 +46,14 @@ def _min_expected_frames(phonemes: str) -> int:
 # dataset finetune — xem vieneu_utils.core_utils.max_expected_frames). Row ngắn
 # bắn trượt stop token thì bị cắt tại trần của CHÍNH row đó thay vì chạy hết
 # max_new_frames của cả batch.
-from vieneu_utils.core_utils import max_expected_frames, BABBLE_MAX_RETRIES, babble_suspect, babble_prefer
+from vieneu_utils.core_utils import max_expected_frames, BABBLE_MAX_RETRIES, babble_suspect, babble_prefer, check_sampling
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
 
 
 class V3TurboBatchEngine:
@@ -60,6 +69,15 @@ class V3TurboBatchEngine:
         # VIENEU_FUSED_FRAME=0 falls back to the plain per-op loop.
         self._fused = {}
         self.use_fused = os.environ.get("VIENEU_FUSED_FRAME", "1") != "0"
+        # Every run overwrites its graph's buffers (static KV cache, codes, flags),
+        # so runs must not overlap — infer() is called from several threads by the
+        # Gradio app and by servers.
+        self._fused_lock = threading.Lock()
+        # Each graph pins its own static KV cache (hundreds of MB at batch 32), and
+        # a new sampling setting (e.g. a temperature slider) means new graphs: only
+        # the most recently used ``fused_samplings`` settings keep theirs.
+        self._fused_lru: "OrderedDict[tuple, None]" = OrderedDict()
+        self.fused_samplings = max(1, _env_int("VIENEU_FUSED_SAMPLINGS", 2))
         # Called once per generated frame (both loops). A server sets it to
         # its cancel check; raising from it stops the batch within a frame.
         self.frame_hook = None
@@ -125,6 +143,9 @@ class V3TurboBatchEngine:
         It is ignored when ``repetition_penalty != 1.0`` (the penalty needs dynamic
         per-row history, which a static graph cannot hold).
         """
+        # Before any GPU work: a NaN baked into a graph is a device-side assert.
+        temperature, top_k, top_p, repetition_penalty = check_sampling(
+            temperature, top_k, top_p, repetition_penalty)
         # Fill in phonemes up front so the guard can size-check every row (and so
         # retries don't re-phonemize).
         reqs = []
@@ -303,18 +324,40 @@ class V3TurboBatchEngine:
             return 0
         max_len = cache_len_bucket(max_len, int(self.config.max_position_embeddings))
         n = 0
-        for b in batch_sizes:
-            bp = batch_bucket(int(b))
-            key = (bp, max_len, round(temperature, 4), int(top_k), round(top_p, 4),
-                   round(repetition_penalty, 4), int(repetition_window))
-            if key not in self._fused:
-                self._fused[key] = FusedFrame(
+        with self._fused_lock:
+            for b in batch_sizes:
+                bp = batch_bucket(int(b))
+                key = (bp, max_len, round(temperature, 4), int(top_k), round(top_p, 4),
+                       round(repetition_penalty, 4), int(repetition_window))
+                if key not in self._fused:
+                    n += 1
+                self._fused_frame(key, lambda bp=bp: FusedFrame(
                     self.model, bp, max_len, self.FUSED_MAX_FRAMES,
                     temperature=temperature, top_k=top_k, top_p=top_p,
                     repetition_penalty=repetition_penalty, repetition_window=repetition_window,
-                )
-                n += 1
+                ))
         return n
+
+    def _fused_frame(self, key: tuple, create):
+        """The cached graph for ``key``; ``create()`` captures it on first use.
+
+        Call with ``_fused_lock`` held. Using a sampling setting (``key[2:]``)
+        makes it the most recent; the graphs of older settings beyond
+        ``fused_samplings`` are dropped before a new capture allocates.
+        """
+        sampling = key[2:]
+        self._fused_lru[sampling] = None
+        self._fused_lru.move_to_end(sampling)
+        while len(self._fused_lru) > self.fused_samplings:
+            old, _ = self._fused_lru.popitem(last=False)
+            for k in [k for k in self._fused if k[2:] == old]:
+                del self._fused[k]
+            logger.info("v3 Turbo: freed the CUDA graphs of sampling %s (keeping %d settings; "
+                        "VIENEU_FUSED_SAMPLINGS)", old, self.fused_samplings)
+        fused = self._fused.get(key)
+        if fused is None:
+            fused = self._fused[key] = create()
+        return fused
 
     @torch.no_grad()
     def _generate_codes_fused(
@@ -344,14 +387,12 @@ class V3TurboBatchEngine:
         max_len = cache_len_bucket(T + max_new_frames + 1, int(cfg.max_position_embeddings))
         key = (Bp, max_len, round(temperature, 4), int(top_k), round(top_p, 4),
                round(repetition_penalty, 4), int(repetition_window))
-        fused = self._fused.get(key)
-        if fused is None:
-            fused = FusedFrame(
+        with self._fused_lock:
+            fused = self._fused_frame(key, lambda: FusedFrame(
                 self.model, Bp, max_len, self.FUSED_MAX_FRAMES,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty, repetition_window=repetition_window,
-            )
-            self._fused[key] = fused
-        h, cache, mask, pos = self.bb.prefill(embeds_p)
-        codes = fused.run(h, cache, mask, pos, caps, spk_p, max_new_frames, on_frame=self.frame_hook)
-        return codes[:B]
+            ))
+            h, cache, mask, pos = self.bb.prefill(embeds_p)
+            codes = fused.run(h, cache, mask, pos, caps, spk_p, max_new_frames, on_frame=self.frame_hook)
+        return codes[:B]   # run() returns clones, safe to use after the lock
