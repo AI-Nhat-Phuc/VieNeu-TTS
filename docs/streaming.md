@@ -38,6 +38,8 @@ Both paths sit behind **the same API**; the server picks the backend (`VIENEU_BA
 
 Pick **one** of the following — every variant listens on `http://0.0.0.0:8000`:
 
+> No CUDA GPU (AMD Radeon, Intel Arc)? Run the backbone on llama.cpp's Vulkan backend: see [llamacpp.md](llamacpp.md).
+
 ```bash
 # (a) From the repo — GPU when CUDA is present, otherwise CPU
 uv run python -m apps.openai_speech

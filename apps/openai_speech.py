@@ -46,6 +46,11 @@ Environment:
     VIENEU_BACKEND=auto|onnx|pytorch   VIENEU_DEVICE=auto|cuda|cpu
     VIENEU_PRECISION=fp32|int8 (CPU)   VIENEU_ONNX_DIR=... (local ONNX export)
     VIENEU_MAX_STREAMS=16 (GPU)        VIENEU_QUEUE=16   VIENEU_QUEUE_TIMEOUT=10
+    VIENEU_THREADS=0 (ONNX intra-op threads; 0 = engine default)
+    VIENEU_LLAMACPP_LIB=<llama.cpp release dir>  backbone on llama.cpp — Vulkan on
+                        any GPU (AMD/Intel/NVIDIA) or ggml CPU, streams batched;
+                        VIENEU_LLAMACPP_NGL=99 (0 = CPU)  VIENEU_LLAMACPP_TYPE=q8_0
+                        VIENEU_LLAMACPP_SEQS=16  VIENEU_LLAMACPP_GGUF=... (docs/llamacpp.md)
     VIENEU_API_KEY=...  (Bearer auth; unset = open — logged as a warning when
                         HOST is not a loopback address)
     VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
@@ -104,6 +109,7 @@ class Engine:
         kw: dict = dict(backend=backend, device=device,
                         precision=os.environ.get("VIENEU_PRECISION", "fp32"),
                         onnx_dir=os.environ.get("VIENEU_ONNX_DIR") or None,
+                        threads=_env_int("VIENEU_THREADS", 0),
                         max_streams=_env_int("VIENEU_MAX_STREAMS", 16))
         log.info("⏳ loading VieNeu-TTS v3 Turbo (backend=%s device=%s)", backend, device)
         t = time.perf_counter()
@@ -116,12 +122,18 @@ class Engine:
         # GPU: the scheduler batches every stream. CPU: the ONNX engine interleaves
         # calls frame by frame, but they share the cores — measured on a 6-core
         # desktop, fp32 keeps one stream real-time (RTF 0.58; two → 1.19), int8
-        # two (RTF 0.35; two → 0.67). VIENEU_MAX_STREAMS overrides either.
+        # two (RTF 0.35; two → 0.67). With the llama.cpp backbone
+        # (VIENEU_LLAMACPP_LIB) streams run in parallel and the backbone steps are
+        # batched — four stay real-time on a Ryzen 5 3600 + RX 590 (docs/llamacpp.md).
+        # VIENEU_MAX_STREAMS overrides any of these.
         self.sched = self.tts._get_stream_scheduler() if self.backend == "pytorch" else None
+        batcher = getattr(getattr(self.tts, "engine", None), "batcher", None)
         if self.sched is not None:
             self.max_streams = self.sched.B
         else:
             cpu_default = 2 if kw["precision"] == "int8" else 1
+            if batcher is not None:
+                cpu_default = min(4, batcher.bb.n_seq_max)
             self.max_streams = _env_int("VIENEU_MAX_STREAMS", cpu_default) if "VIENEU_MAX_STREAMS" in os.environ else cpu_default
         self.max_queue = _env_int("VIENEU_QUEUE", self.max_streams)
         self.queue_timeout = float(os.environ.get("VIENEU_QUEUE_TIMEOUT", "10"))
