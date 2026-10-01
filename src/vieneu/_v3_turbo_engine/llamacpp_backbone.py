@@ -132,7 +132,9 @@ class LlamaBackbone:
         cp.n_threads = cp.n_threads_batch = thr
         cp.embeddings = True
         cp.pooling_type = 0          # NONE: per-token hidden states
-        cp.kv_unified = False
+        # One KV buffer for all sequences: a decode of N streams is one ubatch
+        # (split per-sequence caches cost ~1.5-3x per step on Vulkan).
+        cp.kv_unified = True
         cp.no_perf = True
         self.ctx = L.llama_init_from_model(self.model, cp)
         if not self.ctx:
@@ -153,22 +155,23 @@ class LlamaBackbone:
         n = sum(int(e.shape[0]) for _, e, _ in rows)
         if n > self.n_batch:
             raise ValueError(f"batch of {n} tokens exceeds n_batch={self.n_batch}")
-        b = self._batch
         flat = np.ascontiguousarray(np.concatenate([e for _, e, _ in rows], 0), dtype=np.float32)
-        C.memmove(b.embd, flat.ctypes.data, flat.nbytes)
-        out_idx = []
-        k = 0
-        for seq, e, p0 in rows:
-            for t in range(e.shape[0]):
-                b.pos[k] = p0 + t
-                b.n_seq_id[k] = 1
-                b.seq_id[k][0] = seq
-                b.logits[k] = 0
-                k += 1
-            b.logits[k - 1] = 1
-            out_idx.append(k - 1)
-        b.n_tokens = n
+        # The batch buffer is shared, so filling it is part of the critical section.
         with self._lock:
+            b = self._batch
+            C.memmove(b.embd, flat.ctypes.data, flat.nbytes)
+            out_idx = []
+            k = 0
+            for seq, e, p0 in rows:
+                for t in range(e.shape[0]):
+                    b.pos[k] = p0 + t
+                    b.n_seq_id[k] = 1
+                    b.seq_id[k][0] = seq
+                    b.logits[k] = 0
+                    k += 1
+                b.logits[k - 1] = 1
+                out_idx.append(k - 1)
+            b.n_tokens = n
             rc = self.L.llama_decode(self.ctx, b)
             if rc != 0:
                 raise RuntimeError(f"llama_decode failed ({rc})")

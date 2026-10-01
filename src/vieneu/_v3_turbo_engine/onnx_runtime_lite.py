@@ -186,6 +186,7 @@ class OnnxV3LiteEngine:
         # VIENEU_LLAMACPP_LIB=<dir with llama.dll|libllama.so> swaps the backbone
         # prefill/decode graphs for llama.cpp, batched across concurrent streams.
         self.batcher = None
+        self.sched = None
         self._gen_lock = self._lock
         lib = os.environ.get("VIENEU_LLAMACPP_LIB")
         if lib:
@@ -194,14 +195,16 @@ class OnnxV3LiteEngine:
     def _init_llamacpp(self, lib_dir: str, repo: str) -> None:
         import contextlib
 
+        from huggingface_hub import hf_hub_download
+
         from .llamacpp_backbone import LlamaBackbone, StepBatcher, convert_backbone_gguf
         qtype = os.environ.get("VIENEU_LLAMACPP_TYPE", "q8_0")
         gguf_path = os.environ.get("VIENEU_LLAMACPP_GGUF")
+        batched_ac = os.environ.get("VIENEU_ACOUSTIC_BATCHED", "1") != "0"
+        # The original weights behind the onnx_update graphs (backbone checked to
+        # match them to ~1e-4) live in update/model.safetensors.
+        st = hf_hub_download(repo, "model.safetensors", subfolder="update") if (batched_ac or not gguf_path) else None
         if not gguf_path:
-            # The backbone weights behind the onnx_update graphs (checked to match
-            # them to ~1e-4) live in update/model.safetensors; convert once.
-            from huggingface_hub import hf_hub_download
-            st = hf_hub_download(repo, "model.safetensors", subfolder="update")
             cfg = hf_hub_download(repo, "config.json", subfolder="update")
             gguf_path = str(Path(st).parent / f"backbone-{qtype}.gguf")
             if not os.path.isfile(gguf_path):
@@ -212,11 +215,39 @@ class OnnxV3LiteEngine:
         bb = LlamaBackbone(gguf_path, lib_dir, n_gpu_layers=ngl, n_seq_max=seqs,
                            n_ctx_per_seq=int(self.cfg.get("max_position_embeddings", 2048)),
                            threads=self.ort_intra_op_threads)
-        self.batcher = StepBatcher(bb)
+        if batched_ac:
+            # All streams step in lockstep: one backbone call + one batched
+            # acoustic pass per frame round (lite_scheduler.py).
+            from .lite_scheduler import FrameScheduler
+            quant = os.environ.get("VIENEU_ACOUSTIC_QUANT", "int8")
+            head = self._batched_acoustic_head(st, str(Path(st).parent / f"acoustic-batched-{quant}-v1.onnx"), quant)
+            self.sched = FrameScheduler(self, head, bb)
+        else:
+            self.batcher = StepBatcher(bb)
         # Streams no longer serialize on the engine lock: llama.cpp calls go through
-        # the batcher and ORT sessions are safe to run from several threads.
+        # the scheduler/batcher and ORT sessions are safe to run from several threads.
         self._gen_lock = contextlib.nullcontext()
-        logger.info("✅ llama.cpp backbone: %s (gpu_layers=%d, seqs=%d)", Path(gguf_path).name, ngl, seqs)
+        logger.info("✅ llama.cpp backbone: %s (gpu_layers=%d, seqs=%d, %s)", Path(gguf_path).name, ngl, seqs,
+                    "frame scheduler + batched acoustic head" if batched_ac else "per-stream acoustic head")
+
+    def _batched_acoustic_head(self, safetensors_path: str, onnx_path: str, quant: str):
+        """The acoustic head as a batched graph, built once from the weights
+        (``quant``: int8 = per-row int8, the default; fp32)."""
+        import onnxruntime as ort
+
+        from .acoustic_batched import AcousticHead, build_acoustic_onnx, read_safetensors
+        if not os.path.isfile(onnx_path):
+            logger.info("⏳ building batched acoustic graph (one time) → %s", onnx_path)
+            build_acoustic_onnx(read_safetensors(safetensors_path, "acoustic_decoder."),
+                                self.L_loc, self.nH_loc, float(self.cfg.get("rms_norm_eps", 1e-6)), onnx_path, quant)
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.inter_op_num_threads = 1
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        # The scheduler thread runs it for every stream; it is memory-bound, so a
+        # few threads get most of the speed and leave cores to the codec.
+        so.intra_op_num_threads = int(os.environ.get("VIENEU_ACOUSTIC_THREADS", "0")) or             min(max((os.cpu_count() or 8) // 4, 1), 4)
+        return AcousticHead(onnx_path, self.L_loc, self.nH_loc, self.hidden, so)
 
     # ── backbone: ONNX graphs or llama.cpp ─────────────────────────────────────
     def _bb_begin(self, prompt_embeds: np.ndarray):
@@ -241,6 +272,36 @@ class OnnxV3LiteEngine:
     def _bb_end(self, state) -> None:
         if self.batcher is not None:
             self.batcher.end(state)
+
+    def _iter_frames(self, prompt_embeds: np.ndarray, anchor, params, max_new_frames: int):
+        """Yield ``(codes, eos)`` per frame, ending with the EOS frame or at the cap.
+
+        With the frame scheduler (llama.cpp backbone + batched acoustic head) the
+        frames come from rounds shared with every other stream; otherwise this
+        stream runs the acoustic head and the backbone itself, one frame per lock.
+        """
+        if self.sched is not None:
+            yield from self.sched.generate(prompt_embeds[0], anchor, params, max_new_frames)
+            return
+        temperature, top_k, top_p, repetition_penalty, hist = params
+        with self._gen_lock:
+            h, st = self._bb_begin(prompt_embeds)
+        try:
+            Tprompt = prompt_embeds.shape[1]
+            for t in range(max_new_frames):
+                with self._gen_lock:
+                    codes, eos = self._acoustic_frame(h, temperature, top_k, top_p, repetition_penalty, hist)
+                    if not eos:
+                        slot = np.full((1, 1, self.n_vq + 1), self.audio_pad, dtype=np.int64)
+                        slot[:, :, 0] = self.sgs
+                        slot[0, 0, 1:] = codes
+                        se = self._embed_rows(slot[0], anchor)          # (1,1,H)
+                        h, st = self._bb_step(st, se, Tprompt + t)
+                yield codes, eos
+                if eos:
+                    break
+        finally:
+            self._bb_end(st)
 
     # ── artifact helpers ──────────────────────────────────────────────────────
     @staticmethod
@@ -465,25 +526,11 @@ class OnnxV3LiteEngine:
         prompt_embeds = self._embed_rows(rows, anchor)              # (1, T, H)
 
         def _gen_once() -> List[np.ndarray]:
-            with self._gen_lock:
-                h, st = self._bb_begin(prompt_embeds)
-                try:
-                    Tprompt = prompt_embeds.shape[1]
-                    hist = RepetitionHistory(self.n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
-                    frames: List[np.ndarray] = []
-                    for t in range(max_new_frames):
-                        codes, eos = self._acoustic_frame(h, temperature, top_k, top_p, repetition_penalty, hist)
-                        frames.append(np.asarray(codes, dtype=np.int64))
-                        if eos:
-                            break
-                        slot = np.full((1, 1, self.n_vq + 1), self.audio_pad, dtype=np.int64)
-                        slot[:, :, 0] = self.sgs
-                        slot[0, 0, 1:] = codes
-                        se = self._embed_rows(slot[0], anchor)          # (1,1,H)
-                        h, st = self._bb_step(st, se, Tprompt + t)
-                finally:
-                    self._bb_end(st)
-            return frames
+            hist = RepetitionHistory(self.n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
+            params = (temperature, top_k, top_p, repetition_penalty, hist)
+            with self._gen_lock:   # ONNX path: one utterance at a time (as before)
+                return [np.asarray(c, dtype=np.int64)
+                        for c, _ in self._iter_frames(prompt_embeds, anchor, params, max_new_frames)]
 
         frames = _gen_once()
         if not frames:
@@ -573,11 +620,9 @@ class OnnxV3LiteEngine:
         rows = self._build_rows(phonemes, ref_codes, style_id)
         prompt_embeds = self._embed_rows(rows, anchor)
 
-        # Prefill under the generation lock, then per-iteration session calls
-        with self._gen_lock:
-            h, st = self._bb_begin(prompt_embeds)
-        Tprompt = prompt_embeds.shape[1]
         hist = RepetitionHistory(self.n_vq, repetition_window) if not math.isclose(repetition_penalty, 1.0) else None
+        frames = self._iter_frames(prompt_embeds, anchor, (temperature, top_k, top_p, repetition_penalty, hist),
+                                   max_new_frames)
 
         state = self._stream_new_state()
         buffer: List[np.ndarray] = []
@@ -599,33 +644,21 @@ class OnnxV3LiteEngine:
             return cap
 
         try:
-            for t in range(max_new_frames):
-                wav_chunk = None
-                # protect session calls per-iteration; release before yielding
-                with self._gen_lock:
-                    codes, eos = self._acoustic_frame(h, temperature, top_k, top_p, repetition_penalty, hist)
-                    buffer.append(np.asarray(codes, dtype=np.int64))
-                    if not eos:
-                        slot = np.full((1, 1, self.n_vq + 1), self.audio_pad, dtype=np.int64)
-                        slot[:, :, 0] = self.sgs
-                        slot[0, 0, 1:] = codes
-                        se = self._embed_rows(slot[0], anchor)
-                        h, st = self._bb_step(st, se, Tprompt + t)
-                    if len(buffer) >= _target() or eos:
+            for codes, eos in frames:
+                buffer.append(np.asarray(codes, dtype=np.int64))
+                if len(buffer) >= _target() or eos:
+                    with self._gen_lock:
                         wav_chunk = self._stream_decode(np.stack(buffer), state)
-                        buffer = []
-
-                # yield after the lock is released
-                if wav_chunk is not None and wav_chunk.size:
-                    if t_first is None:
-                        t_first = time.perf_counter()
-                    emitted += wav_chunk.size
-                    yield wav_chunk
-                if eos:
-                    break
+                    buffer = []
+                    if wav_chunk.size:
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        emitted += wav_chunk.size
+                        yield wav_chunk
         finally:
-            # also runs when the consumer closes the generator (client disconnect)
-            self._bb_end(st)
+            # also runs when the consumer closes this generator (client disconnect):
+            # frees the backbone sequence / scheduler slot
+            frames.close()
 
         if buffer:
             with self._gen_lock:

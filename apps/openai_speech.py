@@ -51,6 +51,8 @@ Environment:
                         any GPU (AMD/Intel/NVIDIA) or ggml CPU, streams batched;
                         VIENEU_LLAMACPP_NGL=99 (0 = CPU)  VIENEU_LLAMACPP_TYPE=q8_0
                         VIENEU_LLAMACPP_SEQS=16  VIENEU_LLAMACPP_GGUF=... (docs/llamacpp.md)
+                        VIENEU_ACOUSTIC_BATCHED=1  VIENEU_ACOUSTIC_QUANT=int8|fp32
+                        VIENEU_ACOUSTIC_THREADS=0 (0 = cores/4, max 4)
     VIENEU_API_KEY=...  (Bearer auth; unset = open — logged as a warning when
                         HOST is not a loopback address)
     VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
@@ -123,16 +125,20 @@ class Engine:
         # calls frame by frame, but they share the cores — measured on a 6-core
         # desktop, fp32 keeps one stream real-time (RTF 0.58; two → 1.19), int8
         # two (RTF 0.35; two → 0.67). With the llama.cpp backbone
-        # (VIENEU_LLAMACPP_LIB) streams run in parallel and the backbone steps are
-        # batched — four stay real-time on a Ryzen 5 3600 + RX 590 (docs/llamacpp.md).
+        # (VIENEU_LLAMACPP_LIB) all streams step together through one frame
+        # scheduler — six stay real-time on a Ryzen 5 3600 + RX 590, four with the
+        # per-stream acoustic head (docs/llamacpp.md).
         # VIENEU_MAX_STREAMS overrides any of these.
         self.sched = self.tts._get_stream_scheduler() if self.backend == "pytorch" else None
-        batcher = getattr(getattr(self.tts, "engine", None), "batcher", None)
+        lite = getattr(self.tts, "engine", None)
+        lite_sched, batcher = getattr(lite, "sched", None), getattr(lite, "batcher", None)
         if self.sched is not None:
             self.max_streams = self.sched.B
         else:
             cpu_default = 2 if kw["precision"] == "int8" else 1
-            if batcher is not None:
+            if lite_sched is not None:
+                cpu_default = min(6, lite_sched.bb.n_seq_max)
+            elif batcher is not None:
                 cpu_default = min(4, batcher.bb.n_seq_max)
             self.max_streams = _env_int("VIENEU_MAX_STREAMS", cpu_default) if "VIENEU_MAX_STREAMS" in os.environ else cpu_default
         self.max_queue = _env_int("VIENEU_QUEUE", self.max_streams)
