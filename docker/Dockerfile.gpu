@@ -49,3 +49,16 @@ COPY --chown=app:app examples/audio_ref/ examples/audio_ref/
 USER app
 EXPOSE 7860
 CMD ["python", "apps/gradio_main.py"]
+
+# --- Stage: api (OpenAI-compatible speech API on CUDA; what RunPod pods run) ---
+#   docker build --target api -t vieneu-tts:api-gpu -f docker/Dockerfile.gpu .
+#   docker run --gpus all -p 8000:8000 -e VIENEU_API_KEY=... vieneu-tts:api-gpu
+FROM prod AS api
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    VIENEU_BACKEND=pytorch \
+    VIENEU_DEVICE=cuda
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+CMD ["python", "-m", "apps.openai_speech"]
