@@ -1,0 +1,4 @@
+root = true
+
+[*.{json,py,md,yaml,yml,toml,txt,srt}]
+charset = utf-8
