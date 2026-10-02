@@ -128,3 +128,27 @@ Two approaches were measured and dropped:
   RTF 3.4 with every graph on the GPU, i.e. slower than real time.
 - **Splitting streams over two scheduler threads**, to overlap the GPU step with
   the CPU acoustic pass, lowered throughput because the CPU was already the limit.
+
+## Monitoring (Windows desktop app)
+
+`apps/monitor_desktop.py` is a small Tkinter app with no extra packages. It shows:
+
+- server health and active streams
+- whether the public URL is reachable
+- the `cloudflared` process and the scheduled task
+- CPU / RAM
+- a 5-minute load chart
+- speech-request counts with average TTFA and RTF, read from the server log
+- the server, tunnel and watchdog logs, with filtering and error highlighting
+
+It also has buttons to restart the server or the tunnel, and to start or stop
+everything.
+
+```bash
+.venv\Scripts\pythonw.exe -m apps.monitor_desktop --logs <log dir> --public-url https://tts.example.com --task VieNeu-TTS
+```
+
+It expects a watchdog that runs `serve_public.ps1` and `cloudflared tunnel run`,
+writing `server.err.log`, `server.out.log`, `tunnel.err.log` and `watchdog.log`
+to the log directory. The restart buttons kill a process and rely on that
+watchdog to start it again.

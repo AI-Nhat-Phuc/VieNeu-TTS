@@ -18,6 +18,7 @@ from llama.h at release b11321.
 from __future__ import annotations
 
 import ctypes as C
+import logging
 import os
 import sys
 import threading
@@ -62,6 +63,29 @@ class _Batch(C.Structure):
 _LIB = None
 _LIB_LOCK = threading.Lock()
 
+# llama.cpp prints every tensor and buffer at load time; keep only warnings and
+# errors, through Python logging. ggml_log_level: DEBUG=1 INFO=2 WARN=3 ERROR=4,
+# CONT=5 continues the previous message.
+_log = logging.getLogger("Vieneu.llama.cpp")
+_LOG_CB_T = C.CFUNCTYPE(None, C.c_int, C.c_char_p, C.c_void_p)
+_last_level = [0]
+
+
+# Expected with embeddings input (llama.cpp then outputs every token): logged on each prefill.
+_BENIGN = ("were not marked as outputs",)
+
+
+def _on_llama_log(level, text, _user):
+    if level != 5:
+        _last_level[0] = level
+    if _last_level[0] >= 3:
+        msg = (text or b"").decode("utf-8", "replace").rstrip()
+        if msg and not any(b in msg for b in _BENIGN):
+            _log.log(logging.ERROR if _last_level[0] >= 4 else logging.WARNING, msg)
+
+
+_LOG_CB = _LOG_CB_T(_on_llama_log)   # module-level: must outlive the library
+
 
 def _load_lib(lib_dir: str):
     global _LIB
@@ -71,9 +95,15 @@ def _load_lib(lib_dir: str):
         d = str(Path(lib_dir).resolve())
         if sys.platform == "win32":
             os.add_dll_directory(d)
-            ggml, llama = C.CDLL(os.path.join(d, "ggml.dll")), C.CDLL(os.path.join(d, "llama.dll"))
+            lib = lambda n: C.CDLL(os.path.join(d, f"{n}.dll"))
         else:
-            ggml, llama = C.CDLL(os.path.join(d, "libggml.so")), C.CDLL(os.path.join(d, "libllama.so"))
+            lib = lambda n: C.CDLL(os.path.join(d, f"lib{n}.so"))
+        ggml_base, ggml, llama = lib("ggml-base"), lib("ggml"), lib("llama")
+        # Quiet logging first, so backend/device init goes through it too.
+        for fn in (ggml_base.ggml_log_set, llama.llama_log_set):
+            fn.argtypes = [_LOG_CB_T, C.c_void_p]
+            fn.restype = None
+            fn(_LOG_CB, None)
         # Release builds ship the CPU/Vulkan backends as loadable modules.
         ggml.ggml_backend_load_all_from_path.argtypes = [C.c_char_p]
         ggml.ggml_backend_load_all_from_path(d.encode())
