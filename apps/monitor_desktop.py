@@ -1,6 +1,6 @@
 """
 VieNeu-TTS Monitor — a small desktop app (Tkinter, Windows) for a self-hosted
-``apps/openai_speech.py`` server: live status, a load chart, request counts, the
+``apps/openai_speech.py`` server: live status (incl. GPU load / VRAM), a load chart, request counts, the
 server / tunnel / watchdog logs, and buttons to restart things.
 
     .venv\\Scripts\\pythonw.exe -m apps.monitor_desktop \\
@@ -35,7 +35,8 @@ LOG_TAIL_BYTES = 200_000
 NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW for helper processes
 
 COLORS = {"bg": "#16181d", "panel": "#1f232b", "fg": "#e6e8eb", "muted": "#8b93a1",
-          "ok": "#3fb950", "warn": "#d29922", "bad": "#f85149", "accent": "#58a6ff", "cpu": "#bc8cff"}
+          "ok": "#3fb950", "warn": "#d29922", "bad": "#f85149", "accent": "#58a6ff", "cpu": "#bc8cff",
+          "gpu": "#f0883e"}
 
 
 # ── system metrics (no psutil) ────────────────────────────────────────────────
@@ -76,6 +77,116 @@ class SystemStats:
         return m.dwMemoryLoad, (m.ullTotalPhys - m.ullAvailPhys) / 2**30, m.ullTotalPhys / 2**30
 
 
+class _PdhValue(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("pad", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhItem(ctypes.Structure):
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _PdhValue)]
+
+
+class _DxgiDesc(ctypes.Structure):
+    _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", ctypes.c_uint), ("DeviceId", ctypes.c_uint),
+                ("SubSysId", ctypes.c_uint), ("Revision", ctypes.c_uint), ("DedicatedVideoMemory", ctypes.c_size_t),
+                ("DedicatedSystemMemory", ctypes.c_size_t), ("SharedSystemMemory", ctypes.c_size_t),
+                ("LuidLow", wintypes.DWORD), ("LuidHigh", wintypes.LONG), ("Flags", ctypes.c_uint)]
+
+
+def _com_call(obj, index, restype, *args):
+    """Call vtable slot ``index`` of a COM object pointer."""
+    fn = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents[index]
+    argtypes = [ctypes.c_void_p if type(a).__name__ == "CArgObject" else type(a) for a in args]  # byref() -> pointer
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(fn)(obj, *args)
+
+
+def dxgi_adapters() -> dict:
+    """``{"luid_0x…_0x…": (name, dedicated VRAM bytes)}`` for the hardware adapters (DXGI, no admin)."""
+    out = {}
+    try:
+        iid = (ctypes.c_byte * 16).from_buffer_copy(          # IID_IDXGIFactory1 770aae78-f26f-4dba-a829-253c83d1b387
+            bytes.fromhex("78ae0a776ff2ba4da829253c83d1b387"))
+        factory = ctypes.c_void_p()
+        if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0:
+            return out
+        i = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if _com_call(factory, 12, ctypes.c_long, ctypes.c_uint(i), ctypes.byref(adapter)) != 0:  # EnumAdapters1
+                break
+            d = _DxgiDesc()
+            if _com_call(adapter, 10, ctypes.c_long, ctypes.byref(d)) == 0 and not d.Flags & 2:  # GetDesc1, skip software
+                out["luid_0x%08X_0x%08X" % (d.LuidHigh & 0xFFFFFFFF, d.LuidLow)] = (d.Description,
+                                                                                    d.DedicatedVideoMemory)
+            _com_call(adapter, 2, ctypes.c_ulong)                                                  # Release
+            i += 1
+        _com_call(factory, 2, ctypes.c_ulong)
+    except Exception:
+        pass
+    return out
+
+
+class GpuStats:
+    """GPU load and VRAM from the Windows "GPU Engine" / "GPU … Memory" performance counters
+    (what Task Manager shows; works for AMD/Intel/NVIDIA, needs Windows 10 1709+)."""
+
+    COUNTERS = {"engine": r"\GPU Engine(*)\Utilization Percentage",
+                "adapter": r"\GPU Adapter Memory(*)\Dedicated Usage",
+                "process": r"\GPU Process Memory(*)\Dedicated Usage"}
+
+    def __init__(self):
+        self.adapters = dxgi_adapters()
+        self.ok, self.pdh, self.query, self.handles = False, None, wintypes.HANDLE(), {}
+        try:
+            self.pdh = ctypes.windll.pdh
+            if self.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
+                return
+            for key, path in self.COUNTERS.items():
+                h = wintypes.HANDLE()
+                if self.pdh.PdhAddEnglishCounterW(self.query, path, 0, ctypes.byref(h)) != 0:
+                    return
+                self.handles[key] = h
+            self.pdh.PdhCollectQueryData(self.query)            # utilization is a rate: needs two samples
+            self.ok = True
+        except Exception:
+            pass
+
+    def _values(self, key):
+        size, n = wintypes.DWORD(0), wintypes.DWORD(0)
+        fmt = 0x200 | 0x8000                                    # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+        self.pdh.PdhGetFormattedCounterArrayW(self.handles[key], fmt, ctypes.byref(size), ctypes.byref(n), None)
+        if not size.value:
+            return []
+        buf = (ctypes.c_byte * size.value)()
+        if self.pdh.PdhGetFormattedCounterArrayW(self.handles[key], fmt, ctypes.byref(size), ctypes.byref(n),
+                                                 buf) != 0:
+            return []
+        items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
+        return [(items[i].szName, items[i].FmtValue.doubleValue) for i in range(n.value)
+                if items[i].FmtValue.CStatus in (0, 1)]         # PDH_CSTATUS_VALID_DATA / NEW_DATA
+
+    def sample(self, pids=()) -> dict | None:
+        """Busiest adapter: ``{name, util, engine, used, total, proc}`` (bytes; ``proc`` = VRAM of ``pids``)."""
+        if not self.ok or self.pdh.PdhCollectQueryData(self.query) != 0:
+            return None
+        used = dict(self._values("adapter"))                    # luid_…_phys_0 -> bytes
+        if not used:
+            return None
+        engines = collections.defaultdict(float)                # (luid, engine type) -> % summed over processes
+        for name, v in self._values("engine"):
+            m = re.search(r"(luid_\w+?_phys_\d+).*engtype_(.*)$", name)
+            if m:
+                engines[(m.group(1), m.group(2))] += v
+        inst = max(used, key=lambda k: (k.rsplit("_phys", 1)[0] in self.adapters, used[k]))
+        luid = inst.rsplit("_phys", 1)[0]
+        util, engine = max(((v, e) for (l, e), v in engines.items() if l == inst), default=(0.0, ""))
+        want = {f"pid_{p}_" for p in pids}
+        proc = sum(v for name, v in self._values("process")
+                   if inst in name and any(name.startswith(w) for w in want))
+        name, total = self.adapters.get(luid, ("GPU", 0))
+        return {"name": name, "util": min(util, 100.0), "engine": engine, "used": used[inst],
+                "total": total, "proc": proc}
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 def http_json(url: str, timeout: float = 4.0):
     t = time.perf_counter()
@@ -101,6 +212,13 @@ def kill_matching(pattern: str) -> str:
     return run_ps("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match '%s' -and "
                   "$_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; "
                   "$_.ProcessId }" % pattern)
+
+
+def server_pids() -> list[int]:
+    """PIDs of the running ``apps.openai_speech`` processes (for their VRAM)."""
+    out = run_ps("Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | Where-Object { "
+                 "$_.CommandLine -match 'apps.openai_speech' } | ForEach-Object { $_.ProcessId }")
+    return [int(x) for x in out.split() if x.isdigit()]
 
 
 def process_alive(image: str) -> bool:
@@ -153,11 +271,12 @@ class Monitor(tk.Tk):
         super().__init__()
         self.args = args
         self.title("VieNeu-TTS Monitor")
-        self.geometry("1100x760")
+        self.geometry("1240x760")
         self.minsize(820, 560)
         self.configure(bg=COLORS["bg"])
         self.sys = SystemStats()
-        self.hist = collections.deque()          # (t, active, max, cpu)
+        self.gpu = GpuStats()
+        self.hist = collections.deque()          # (t, active, max, cpu, gpu %)
         self.req_done = collections.deque(maxlen=200)     # (time, ttfa_ms, rtf) per finished speech request
         self.req_codes = collections.Counter()            # HTTP status of non-/health requests
         self.state = {}
@@ -204,13 +323,14 @@ class Monitor(tk.Tk):
     def _build(self):
         top = ttk.Frame(self, padding=(8, 8, 8, 4))
         top.pack(fill="x")
-        for i in range(5):
+        for i in range(6):
             top.columnconfigure(i, weight=1)
         self.c_server = self._card(top, 0, "Server (local)")
         self.c_public = self._card(top, 1, "Public URL")
         self.c_tunnel = self._card(top, 2, "Cloudflare tunnel")
         self.c_task = self._card(top, 3, "Auto-start task")
         self.c_sys = self._card(top, 4, "CPU / RAM")
+        self.c_gpu = self._card(top, 5, "GPU / VRAM")
 
         mid = ttk.Frame(self, padding=(12, 4))
         mid.pack(fill="x")
@@ -281,8 +401,9 @@ class Monitor(tk.Tk):
                 st["task"] = run_ps(f"(Get-ScheduledTask -TaskName '{self.args.task}' -ErrorAction "
                                     f"SilentlyContinue).State") or "not found"
                 st["tunnel_proc"] = process_alive("cloudflared.exe")
+                st["server_pids"] = server_pids()
             else:
-                st["task"], st["tunnel_proc"] = self.state.get("task"), self.state.get("tunnel_proc")
+                st.update({k: self.state.get(k) for k in ("task", "tunnel_proc", "server_pids")})
             self.state = st
             n += 1
             time.sleep(POLL_S)
@@ -320,7 +441,17 @@ class Monitor(tk.Tk):
         load, used, total = self.sys.ram()
         self._set(self.c_sys, "ok" if cpu < 85 else "warn", f"{cpu:.0f}% · {load}%", f"RAM {used:.1f}/{total:.1f} GB")
 
-        self.hist.append((now, h.get("active", 0) if h else 0, h.get("max_streams", 0) if h else 0, cpu))
+        g = self.gpu.sample(st.get("server_pids") or ())
+        if g:
+            gb = lambda b: b / 2**30
+            vram = f"{gb(g['used']):.1f}/{gb(g['total']):.1f} GB" if g["total"] else f"{gb(g['used']):.1f} GB"
+            hot = g["total"] and g["used"] > 0.9 * g["total"]
+            self._set(self.c_gpu, "warn" if g["util"] >= 90 or hot else "ok", f"{g['util']:.0f}% · {vram}",
+                      f"{g['name'].replace(' Series', '')} · server {gb(g['proc']):.2f} GB · {g['engine'] or 'idle'}")
+        else:
+            self._set(self.c_gpu, "muted", "n/a", "no GPU performance counters")
+        self.hist.append((now, h.get("active", 0) if h else 0, h.get("max_streams", 0) if h else 0, cpu,
+                          g["util"] if g else None))
         while self.hist and now - self.hist[0][0] > HISTORY_S:
             self.hist.popleft()
         self._draw_chart(now)
@@ -344,22 +475,26 @@ class Monitor(tk.Tk):
         w, hgt = max(c.winfo_width(), 200), max(c.winfo_height(), 100)
         pad_l, pad_b, pad_t = 34, 18, 10
         ph = hgt - pad_b - pad_t
-        cap = max([m for _, _, m, _ in self.hist] + [1])
+        cap = max([r[2] for r in self.hist] + [1])
         for i in range(5):
             y = pad_t + ph * i / 4
             c.create_line(pad_l, y, w - 8, y, fill="#2d333b")
         c.create_text(4, pad_t, anchor="nw", text=str(cap), fill=COLORS["accent"], font=("Segoe UI", 8))
         c.create_text(4, pad_t + ph - 10, anchor="nw", text="0", fill=COLORS["muted"], font=("Segoe UI", 8))
-        c.create_text(w - 10, hgt - 4, anchor="se", text="streams (blue) · CPU % (purple) · last 5 min",
+        c.create_text(w - 10, hgt - 4, anchor="se", text="streams (blue) · CPU % (purple) · GPU % (orange) · last 5 min",
                       fill=COLORS["muted"], font=("Segoe UI", 8))
         if len(self.hist) < 2:
             return
         x = lambda t: pad_l + (w - 8 - pad_l) * (1 - (now - t) / HISTORY_S)
-        pts_a, pts_c = [], []
-        for t, a, m, cpu in self.hist:
+        pts_a, pts_c, pts_g = [], [], []
+        for t, a, m, cpu, gpu in self.hist:
             pts_a += [x(t), pad_t + ph * (1 - a / cap)]
             pts_c += [x(t), pad_t + ph * (1 - cpu / 100)]
+            if gpu is not None:
+                pts_g += [x(t), pad_t + ph * (1 - gpu / 100)]
         c.create_line(*pts_c, fill=COLORS["cpu"], width=1.5, smooth=True)
+        if len(pts_g) >= 4:
+            c.create_line(*pts_g, fill=COLORS["gpu"], width=1.5, smooth=True)
         c.create_line(*pts_a, fill=COLORS["accent"], width=2)
 
     def _visible(self, line: str, filt: str) -> bool:

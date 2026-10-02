@@ -1,10 +1,12 @@
 """apps/monitor_desktop.py: the incremental log reader and the log-line parsers
 (no window is opened)."""
+import sys
+
 import pytest
 
 pytest.importorskip("tkinter")
 
-from apps.monitor_desktop import ACCESS_RE, DONE_RE, LogTail
+from apps.monitor_desktop import ACCESS_RE, DONE_RE, GpuStats, LogTail
 
 
 def test_logtail_returns_each_complete_line_once(tmp_path):
@@ -40,3 +42,10 @@ def test_parsers_match_real_server_lines():
     m = ACCESS_RE.search('INFO:     127.0.0.1:57083 - "POST /v1/audio/speech HTTP/1.1" 200 OK')
     assert m and m.groups() == ("POST", "/v1/audio/speech", "200")
     assert ACCESS_RE.search('INFO:     115.72.48.131:0 - "GET /health HTTP/1.1" 200 OK').group(2) == "/health"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows performance counters")
+def test_gpu_sample_is_none_or_complete():
+    g = GpuStats().sample([0])
+    assert g is None or (set(g) == {"name", "util", "engine", "used", "total", "proc"}
+                         and 0 <= g["util"] <= 100 and g["proc"] == 0)
