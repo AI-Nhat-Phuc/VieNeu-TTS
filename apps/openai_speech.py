@@ -62,6 +62,7 @@ Environment:
 from __future__ import annotations
 
 import base64
+import collections
 import hmac
 import io
 import json
@@ -205,6 +206,86 @@ class _Slot:
             self._eng.release()
 
 
+class Activity:
+    """What the server is doing right now, for ``GET /debug/activity`` (the desktop
+    monitor draws it): every request from queued to done, which normalized text
+    chunk it is speaking, and a loudness envelope of the audio it has produced."""
+
+    ENV_WIN = SAMPLE_RATE // 20          # one envelope point per 50 ms of audio
+    ENV_TAIL = 200                       # points sent per live request (10 s)
+
+    def __init__(self, keep: int = 40):
+        self._lock = threading.Lock()
+        self.live: dict = {}
+        self.recent: "collections.deque[dict]" = collections.deque(maxlen=keep)
+        self.served, self.audio_s = 0, 0.0
+        self.started = time.time()
+
+    def start(self, rid: str, req: "SpeechRequest", request: Optional[Request]) -> dict:
+        h = request.headers if request is not None else {}
+        rec = {"id": rid, "state": "queued", "voice": req.voice or "", "text": req.input[:2000],
+               "chars": len(req.input), "format": req.response_format.lower(), "stream": req.stream_format,
+               "rate": req.sample_rate,
+               "client": h.get("cf-connecting-ip") or (request.client.host if request is not None and request.client else "?"),
+               "via": "cloudflare" if "cf-ray" in h else "direct", "country": h.get("cf-ipcountry") or "",
+               "agent": (h.get("user-agent") or "")[:80], "t_start": time.time(), "t_slot": None,
+               "ttfa": None, "audio_s": 0.0, "segments": [], "segment": -1,
+               "env": collections.deque(maxlen=self.ENV_TAIL), "env_n": 0, "_carry": np.zeros(0, np.float32),
+               "t_end": None, "error": None}
+        with self._lock:
+            self.live[rid] = rec
+        return rec
+
+    def segment(self, rec: dict, i: int, chunks: list) -> None:
+        with self._lock:
+            if not rec["segments"]:
+                rec["segments"] = [c[:400] for c in chunks[:64]]
+            rec["segment"] = i
+
+    def audio(self, rec: dict, chunk: np.ndarray) -> None:
+        x = np.concatenate([rec["_carry"], np.asarray(chunk, np.float32)])
+        n = len(x) // self.ENV_WIN
+        rms = np.sqrt(np.mean(x[:n * self.ENV_WIN].reshape(n, self.ENV_WIN) ** 2, axis=1)) if n else ()
+        with self._lock:                 # snapshot() copies these from another thread
+            rec["env"].extend(round(float(v), 4) for v in rms)
+            rec["env_n"] += n
+            rec["_carry"] = x[n * self.ENV_WIN:]
+            rec["audio_s"] += len(chunk) / SAMPLE_RATE
+
+    def set(self, rec: dict, **kw) -> None:
+        with self._lock:
+            rec.update(kw)
+
+    def finish(self, rid: str, state: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            rec = self.live.pop(rid, None)
+            if rec is None:
+                return
+            rec.update(state=state, t_end=time.time(), error=error)
+            env = list(rec["env"])
+            # The finished request keeps a 64-point outline of its (last 10 s of) audio.
+            rec["env"] = [float(max(env[i * len(env) // 64:(i + 1) * len(env) // 64] or [0])) for i in range(64)] \
+                if env else []
+            rec.pop("_carry", None)
+            rec["text"] = rec["text"][:300]
+            rec["segments"] = []
+            self.recent.appendleft(rec)
+            if state == "done":
+                self.served += 1
+                self.audio_s += rec["audio_s"]
+
+    def snapshot(self) -> dict:
+        def pub(r: dict) -> dict:
+            return {k: (list(v) if k == "env" else v) for k, v in r.items() if not k.startswith("_")}
+        with self._lock:
+            live = [pub(r) for r in self.live.values()]
+            recent = [pub(r) for r in self.recent]
+            served, audio_s = self.served, self.audio_s
+        return {"now": time.time(), "started": self.started, "served": served, "audio_s": round(audio_s, 2),
+                "live": live, "recent": recent}
+
+
+ACTIVITY = Activity()
 ENGINE: Optional[Engine] = None
 
 
@@ -308,30 +389,42 @@ class SpeechRequest(BaseModel):
     max_chars: int = Field(256, ge=64, le=512)
 
 
-def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot) -> Iterator[np.ndarray]:
+def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
+                   rec: Optional[dict] = None) -> Iterator[np.ndarray]:
     """float32 chunks at ``req.sample_rate``; logs TTFA / RTF; holds one stream slot."""
     t0 = time.perf_counter()
     first = None
     emitted = 0
     rs = _Resampler(req.sample_rate)
+    state, error = "cancelled", None             # unless the loop runs to the end
     try:
         for chunk in eng.tts.infer_stream(
             req.input, voice=req.voice or None, apply_watermark=eng.watermark,
             temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
             repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
+            on_segment=(lambda i, chunks: ACTIVITY.segment(rec, i, chunks)) if rec else None,
         ):
             if chunk is None or len(chunk) == 0:
                 continue
             if first is None:
                 first = time.perf_counter() - t0
+                if rec:
+                    ACTIVITY.set(rec, state="streaming", ttfa=round(first * 1000))
             emitted += len(chunk)
+            if rec:
+                ACTIVITY.audio(rec, chunk)
             out = rs(chunk)
             if len(out):
                 yield out
         tail = rs(np.zeros(0, np.float32), last=True)
         if len(tail):
             yield tail
+        state = "done"
+    except Exception as e:  # noqa: BLE001 - recorded for the monitor, then re-raised
+        state, error = "error", repr(e)[:200]
+        raise
     finally:
+        ACTIVITY.finish(rid, state, error)
         slot.release()
         total = time.perf_counter() - t0
         audio_s = emitted / SAMPLE_RATE
@@ -361,7 +454,7 @@ def _sse_body(chunks: Iterator[np.ndarray], fmt: str, rate: int) -> Iterator[byt
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(_auth)])
-def speech(req: SpeechRequest):
+def speech(req: SpeechRequest, request: Request = None):
     eng = engine()
     fmt = req.response_format.lower()
     if fmt not in ("pcm", "wav"):
@@ -376,12 +469,19 @@ def speech(req: SpeechRequest):
         # Say so now: once the 200 headers are out, a failure only truncates the body.
         raise HTTPException(503, "speech engine is down; restart the server (see /health)")
     rid = f"spk-{uuid.uuid4().hex[:8]}"
-    eng.acquire()   # 429 if the server is full; released when the stream ends
+    rec = ACTIVITY.start(rid, req, request)
+    try:
+        eng.acquire()   # 429 if the server is full; released when the stream ends
+    except HTTPException:
+        ACTIVITY.finish(rid, "rejected", "server busy (429)")
+        raise
+    ACTIVITY.set(rec, state="prefill", t_slot=time.time())
     slot = _Slot(eng)
-    chunks = _speech_chunks(eng, req, rid, slot)
+    chunks = _speech_chunks(eng, req, rid, slot, rec)
     # A generator that never starts never runs its finally: if the client is gone
     # before the body is read, the slot is freed when the body is dropped.
     weakref.finalize(chunks, slot.release)
+    weakref.finalize(chunks, ACTIVITY.finish, rid, "cancelled")   # no-op once the stream finished
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
     ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
     if ignored:
@@ -453,6 +553,30 @@ def add_voice(name: str = Form(...), file: UploadFile = File(...), denoise: bool
     finally:
         os.unlink(path)
     return {"id": name, "name": name, "description": description}
+
+
+LOOPBACK = ("127.0.0.1", "::1")
+
+
+@app.get("/debug/activity", dependencies=[Depends(_auth)])
+def debug_activity(request: Request):
+    """Live requests (with their text) for a monitor on this machine. Anything that
+    came through a proxy or tunnel (cloudflared runs on loopback too) is refused."""
+    proxied = any(k in request.headers for k in ("cf-connecting-ip", "cf-ray", "x-forwarded-for"))
+    if proxied or not request.client or request.client.host not in LOOPBACK:
+        raise HTTPException(404, "Not Found")
+    eng = engine()
+    body = ACTIVITY.snapshot()
+    body["engine"] = {
+        "backend": eng.backend, "max_streams": eng.max_streams, "active": eng.active, "waiting": eng.waiting,
+        "backbone": "llama.cpp" if os.environ.get("VIENEU_LLAMACPP_LIB") else eng.backend,
+        "backbone_gpu": bool(os.environ.get("VIENEU_LLAMACPP_LIB"))
+        and os.environ.get("VIENEU_LLAMACPP_NGL", "99") != "0" or eng.backend == "pytorch",
+        "acoustic": os.environ.get("VIENEU_ACOUSTIC_QUANT", "int8")
+        if os.environ.get("VIENEU_ACOUSTIC_BATCHED", "1") != "0" else "per-stream",
+        "precision": os.environ.get("VIENEU_PRECISION", "fp32"), "watermark": eng.watermark,
+    }
+    return body
 
 
 @app.get("/health")

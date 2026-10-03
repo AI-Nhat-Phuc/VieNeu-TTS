@@ -49,3 +49,40 @@ def test_gpu_sample_is_none_or_complete():
     g = GpuStats().sample([0])
     assert g is None or (set(g) == {"name", "util", "engine", "used", "total", "proc"}
                          and 0 <= g["util"] <= 100 and g["proc"] == 0)
+
+
+def _rec(rid, state, env_n, segment=0):
+    return {"id": rid, "state": state, "voice": "Mai Anh", "text": "Xin chào các bạn.", "client": "1.2.3.4",
+            "via": "cloudflare", "country": "VN", "agent": "python-httpx/0.27", "format": "wav", "rate": 48000,
+            "t_start": 0.0, "t_slot": 0.0, "ttfa": 300, "audio_s": env_n / 20, "segments": ["xin chào", "các bạn"],
+            "segment": segment, "env": [0.1] * min(env_n, 200), "env_n": env_n, "t_end": None, "error": None}
+
+
+def test_live_view_follows_a_request_to_recent():
+    tk = pytest.importorskip("tkinter")
+    from apps.monitor_desktop import COLORS
+    from apps.monitor_live import LiveView
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    try:
+        c = tk.Canvas(root, width=1300, height=800)
+        v = LiveView(c, COLORS, "tts.example.com")
+        eng = {"max_streams": 6, "backbone": "llama.cpp", "backbone_gpu": True, "acoustic": "int8"}
+        v.update({"live": [_rec("spk-1", "streaming", 30)], "recent": [], "engine": eng})
+        v.update({"live": [_rec("spk-1", "streaming", 250, segment=1)], "recent": [], "engine": eng})
+        s = v.streams["spk-1"]
+        assert len(s["env"]) == 230 and s["seg"] == 1      # 30 known + the 200 newest of the 220 new points
+        for _ in range(40):
+            assert v.frame(0.05)                           # something is moving
+        assert any(p["kind"] == "text" for p in v.particles)
+        assert any(p["kind"] == "audio" for p in v.particles)
+        done = dict(_rec("spk-1", "done", 250), t_end=1.0, env=[0.1] * 64)
+        v.update({"live": [], "recent": [done], "engine": eng})
+        for _ in range(30):
+            v.frame(0.05)
+        assert "spk-1" not in v.streams and c.find_withtag("recent")
+    finally:
+        root.destroy()

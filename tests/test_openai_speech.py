@@ -147,3 +147,22 @@ def test_open_public_bind_is_logged(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="vieneu.api"):
         api.main()
     assert "without VIENEU_API_KEY" in caplog.text
+
+
+def test_activity_follows_a_request_from_start_to_done(client, eng, monkeypatch):
+    monkeypatch.setattr(api, "LOOPBACK", ("testclient",))     # TestClient's peer address
+    assert _speech(client, voice="Mai Anh").status_code == 200
+    r = client.get("/debug/activity")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["live"] == [] and body["engine"]["max_streams"] == eng.max_streams
+    done = body["recent"][0]
+    assert done["state"] == "done" and done["voice"] == "Mai Anh" and done["text"] == "Xin chào."
+    assert done["audio_s"] == pytest.approx(0.1) and done["ttfa"] is not None and len(done["env"]) == 64
+
+
+def test_activity_is_not_served_through_a_tunnel(client, monkeypatch):
+    monkeypatch.setattr(api, "LOOPBACK", ("testclient",))
+    # cloudflared connects from loopback too; its headers give it away.
+    assert client.get("/debug/activity", headers={"CF-Connecting-IP": "1.2.3.4"}).status_code == 404
+    assert client.get("/debug/activity", headers={"X-Forwarded-For": "1.2.3.4"}).status_code == 404

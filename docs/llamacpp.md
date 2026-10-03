@@ -131,12 +131,23 @@ Two approaches were measured and dropped:
 
 ## Monitoring (Windows desktop app)
 
-`apps/monitor_desktop.py` is a small Tkinter app with no extra packages. It shows:
+`apps/monitor_desktop.py` is a small Tkinter app with no extra packages. Its
+**Live** tab (`apps/monitor_live.py`) animates what the server is doing: each
+request gets a colour, its real text flows from the client through Cloudflare
+and the API gate into the pipeline (text → phonemes → backbone → acoustic head →
+codec → PCM) and comes back as audio drops sized by the loudness produced. Each
+live request has a lane with its voice, the normalized text chunk being spoken
+(with a reading cursor), a live waveform, time to first audio and speed; finished
+ones go to a Recent list. The data comes from `GET /debug/activity`, which needs
+the API key (read from `.env`) and answers only on loopback without proxy
+headers, so it is never reachable through the tunnel.
+
+It also shows:
 
 - server health and active streams
 - whether the public URL is reachable
 - the `cloudflared` process and the scheduled task
-- CPU / RAM
+- CPU / RAM, GPU load and VRAM (Windows performance counters)
 - a 5-minute load chart
 - speech-request counts with average TTFA and RTF, read from the server log
 - the server, tunnel and watchdog logs, with filtering and error highlighting

@@ -1,7 +1,9 @@
 """
 VieNeu-TTS Monitor — a small desktop app (Tkinter, Windows) for a self-hosted
-``apps/openai_speech.py`` server: live status (incl. GPU load / VRAM), a load chart, request counts, the
-server / tunnel / watchdog logs, and buttons to restart things.
+``apps/openai_speech.py`` server: an animated Live view of what the server is
+doing (``apps/monitor_live.py``, from ``/debug/activity``), status cards (incl. GPU
+load / VRAM), a load chart, request counts, the server / tunnel / watchdog logs,
+and buttons to restart things.
 
     .venv\\Scripts\\pythonw.exe -m apps.monitor_desktop \\
         --logs E:\\vieneu-logs --public-url https://tts.example.com --task VieNeu-TTS
@@ -28,6 +30,8 @@ import tkinter as tk
 import urllib.request
 from ctypes import wintypes
 from tkinter import ttk
+
+from apps.monitor_live import LiveView
 
 HISTORY_S = 300          # chart window
 POLL_S = 2.0
@@ -188,14 +192,31 @@ class GpuStats:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-def http_json(url: str, timeout: float = 4.0):
+def http_json(url: str, timeout: float = 4.0, headers: dict | None = None):
     t = time.perf_counter()
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "vieneu-monitor"}),
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "vieneu-monitor",
+                                                                         **(headers or {})}),
                                     timeout=timeout) as r:
             return json.loads(r.read().decode()), (time.perf_counter() - t) * 1000, None
     except Exception as e:  # unreachable, 5xx, tunnel 502 ...
         return None, None, str(getattr(e, "code", "") or e)[:80]
+
+
+def api_key(explicit: str | None = None) -> str:
+    """The server's key: --api-key, else VIENEU_API_KEY, else the repo's .env (what serve_public.ps1 reads)."""
+    if explicit or os.environ.get("VIENEU_API_KEY"):
+        return explicit or os.environ["VIENEU_API_KEY"]
+    env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(env, encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == "VIENEU_API_KEY":
+                    return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
 
 
 def run_ps(cmd: str, timeout: float = 20) -> str:
@@ -272,8 +293,8 @@ class Monitor(tk.Tk):
         super().__init__()
         self.args = args
         self.title("VieNeu-TTS Monitor")
-        self.geometry("1240x760")
-        self.minsize(820, 560)
+        self.geometry("1320x860")
+        self.minsize(1000, 640)
         self.configure(bg=COLORS["bg"])
         self.sys = SystemStats()
         self.gpu = GpuStats()
@@ -281,13 +302,19 @@ class Monitor(tk.Tk):
         self.req_done = collections.deque(maxlen=200)     # (time, ttfa_ms, rtf) per finished speech request
         self.req_codes = collections.Counter()            # HTTP status of non-/health requests
         self.state = {}
+        self.activity, self.activity_err, self._activity_seen = None, None, None
+        self._public_seen = None
+        self._key = api_key(args.api_key)
         self._style()
         self._build()
         j = lambda fn: LogTail(os.path.join(args.logs, fn))
         self.tails = {"Server": [j("server.err.log"), j("server.out.log")],
                       "Tunnel": [j("tunnel.err.log")], "Watchdog": [j("watchdog.log")]}
         threading.Thread(target=self._poll_loop, daemon=True).start()
+        threading.Thread(target=self._activity_loop, daemon=True).start()
         self.after(500, self._tick)
+        self._last_frame = time.perf_counter()
+        self.after(100, self._animate)
 
     # layout
     def _style(self):
@@ -333,9 +360,28 @@ class Monitor(tk.Tk):
         self.c_sys = self._card(top, 4, "CPU / RAM")
         self.c_gpu = self._card(top, 5, "GPU / VRAM")
 
-        mid = ttk.Frame(self, padding=(12, 4))
+        bar = ttk.Frame(self, padding=(12, 4))
+        bar.pack(fill="x")
+        for text, fn in (("Restart server", self._restart_server), ("Restart tunnel", self._restart_tunnel),
+                         ("Start task", self._start_task), ("Stop all", self._stop_all),
+                         ("Open logs folder", lambda: os.startfile(self.args.logs)),
+                         ("Open public /health", lambda: os.startfile(self.args.public_url + "/health"))):
+            ttk.Button(bar, text=text, command=fn).pack(side="left", padx=(0, 6))
+        self.l_action = ttk.Label(bar, text="", foreground=COLORS["muted"])
+        self.l_action.pack(side="left", padx=8)
+
+        self.tabs = ttk.Notebook(self, padding=(12, 4, 12, 12))
+        self.tabs.pack(fill="both", expand=True)
+        live = ttk.Frame(self.tabs)
+        self.live_canvas = tk.Canvas(live, bg=COLORS["bg"], highlightthickness=0)
+        self.live_canvas.pack(fill="both", expand=True)
+        self.live = LiveView(self.live_canvas, COLORS, self.args.public_url.split("//")[-1])
+        self.tabs.add(live, text="  Live  ")
+        charts = ttk.Frame(self.tabs, padding=(0, 8))
+        self.tabs.add(charts, text="  Charts  ")
+        mid = ttk.Frame(charts)
         mid.pack(fill="x")
-        self.chart = tk.Canvas(mid, height=150, bg=COLORS["panel"], highlightthickness=0)
+        self.chart = tk.Canvas(mid, height=220, bg=COLORS["panel"], highlightthickness=0)
         self.chart.pack(side="left", fill="x", expand=True)
         side = ttk.Frame(mid, style="Card.TFrame", padding=(12, 8))
         side.pack(side="left", fill="y", padx=(8, 0))
@@ -347,18 +393,8 @@ class Monitor(tk.Tk):
         self.l_codes = ttk.Label(side, text="", style="Sub.TLabel", justify="left")
         self.l_codes.pack(anchor="w", pady=(4, 0))
 
-        bar = ttk.Frame(self, padding=(12, 4))
-        bar.pack(fill="x")
-        for text, fn in (("Restart server", self._restart_server), ("Restart tunnel", self._restart_tunnel),
-                         ("Start task", self._start_task), ("Stop all", self._stop_all),
-                         ("Open logs folder", lambda: os.startfile(self.args.logs)),
-                         ("Open public /health", lambda: os.startfile(self.args.public_url + "/health"))):
-            ttk.Button(bar, text=text, command=fn).pack(side="left", padx=(0, 6))
-        self.l_action = ttk.Label(bar, text="", foreground=COLORS["muted"])
-        self.l_action.pack(side="left", padx=8)
-
-        logs = ttk.Frame(self, padding=(12, 4, 12, 12))
-        logs.pack(fill="both", expand=True)
+        logs = ttk.Frame(self.tabs, padding=(0, 8, 0, 0))
+        self.tabs.add(logs, text="  Logs  ")
         filt = ttk.Frame(logs)
         filt.pack(fill="x", pady=(0, 4))
         ttk.Label(filt, text="Filter:").pack(side="left")
@@ -397,8 +433,9 @@ class Monitor(tk.Tk):
             st["local"], st["local_ms"], st["local_err"] = http_json(self.args.local_url + "/health", 3)
             if n % 3 == 0 or "public" not in self.state:
                 st["public"], st["public_ms"], st["public_err"] = http_json(self.args.public_url + "/health", 8)
+                st["public_t"] = time.time()
             else:
-                st.update({k: self.state.get(k) for k in ("public", "public_ms", "public_err")})
+                st.update({k: self.state.get(k) for k in ("public", "public_ms", "public_err", "public_t")})
             if n % 5 == 0 or "task" not in self.state:
                 st["task"] = run_ps(f"(Get-ScheduledTask -TaskName '{self.args.task}' -ErrorAction "
                                     f"SilentlyContinue).State") or "not found"
@@ -410,6 +447,42 @@ class Monitor(tk.Tk):
             n += 1
             time.sleep(POLL_S)
 
+    def _activity_loop(self):
+        """What the server is doing, twice a second (local only; carries the request texts)."""
+        while True:
+            body, _, err = http_json(self.args.local_url + "/debug/activity", 2,
+                                     {"Authorization": f"Bearer {self._key}"} if self._key else None)
+            if body is not None:
+                self.activity, self.activity_err = body, None
+            else:
+                self.activity_err = {"404": "This server has no /debug/activity yet: restart it after updating "
+                                            "(Restart server).",
+                                     "401": "The server wants an API key: set VIENEU_API_KEY in .env or pass "
+                                            "--api-key."}.get(err, f"Server unreachable ({err}).")
+            time.sleep(0.5 if body is not None else 3)
+
+    # animation (Live tab): ~25 fps while visible, idle otherwise
+    def _animate(self):
+        delay = 250
+        try:
+            now = time.perf_counter()
+            dt, self._last_frame = min(0.1, now - self._last_frame), now
+            snap = self.activity
+            if snap is not None and snap is not self._activity_seen:
+                self._activity_seen = snap
+                self.live.update(snap)
+            elif self.activity_err:
+                self.live.set_error(self.activity_err)
+            if self.state.get("public_t") != self._public_seen:
+                self._public_seen = self.state.get("public_t")
+                if self.state.get("public"):
+                    self.live.ping()
+                    self.live.ping_t = self.live.t
+            if self.wm_state() != "iconic" and self.tabs.index(self.tabs.select()) == 0:
+                delay = 60 if self.live.frame(dt) else 100     # ~16 fps while things move, 10 when idle
+        finally:
+            self.after(delay, self._animate)
+
     # UI tick: cards, chart, logs
     def _set(self, card, level, value, sub=""):
         dot, val, lab = card
@@ -418,6 +491,12 @@ class Monitor(tk.Tk):
         lab.configure(text=sub)
 
     def _tick(self):
+        try:
+            self._tick_once()
+        finally:                          # one bad sample must not stop the updates for good
+            self.after(int(POLL_S * 1000), self._tick)
+
+    def _tick_once(self):
         st, now = self.state, time.time()
         h = st.get("local")
         if h:
@@ -442,6 +521,7 @@ class Monitor(tk.Tk):
         cpu = self.sys.cpu()
         load, used, total = self.sys.ram()
         self._set(self.c_sys, "ok" if cpu < 85 else "warn", f"{cpu:.0f}% · {load}%", f"RAM {used:.1f}/{total:.1f} GB")
+        self.live.set_system(cpu, None, None)
 
         g = self.gpu.sample(st.get("server_pids") or ())
         if g:
@@ -450,6 +530,7 @@ class Monitor(tk.Tk):
             hot = g["total"] and g["used"] > 0.9 * g["total"]
             self._set(self.c_gpu, "warn" if g["util"] >= 90 or hot else "ok", f"{g['util']:.0f}% · {vram}",
                       f"{g['name'].replace(' Series', '')} · server {gb(g['proc']):.2f} GB · {g['engine'] or 'idle'}")
+            self.live.set_system(cpu, g["util"], g["name"])
         else:
             self._set(self.c_gpu, "muted", "n/a", "no GPU performance counters")
         self.hist.append((now, h.get("active", 0) if h else 0, h.get("max_streams", 0) if h else 0, cpu,
@@ -469,7 +550,6 @@ class Monitor(tk.Tk):
         bad = sum(n for c, n in self.req_codes.items() if not c.startswith("2"))
         self.l_codes.configure(text=("HTTP " + "  ".join(f"{c}×{n}" for c, n in sorted(self.req_codes.items()))
                                      + (f"   ⚠ {bad} errors" if bad else "")) if self.req_codes else "")
-        self.after(int(POLL_S * 1000), self._tick)
 
     def _draw_chart(self, now):
         c = self.chart
@@ -596,6 +676,7 @@ def main():
     ap.add_argument("--local-url", default=os.environ.get("VIENEU_LOCAL_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--public-url", default=os.environ.get("VIENEU_PUBLIC_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--task", default=os.environ.get("VIENEU_TASK_NAME", "VieNeu-TTS"), help="scheduled task name")
+    ap.add_argument("--api-key", default=None, help="server API key (default: VIENEU_API_KEY or the repo's .env)")
     args = ap.parse_args()
     args.public_url = args.public_url.rstrip("/")
     args.local_url = args.local_url.rstrip("/")

@@ -661,7 +661,11 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         many listeners at once — first audio in ~110-135 ms with up to 8
         streams on an RTX 3060. On CPU/ONNX the engine's own frame-level
         streaming runs, one call at a time.
+
+        ``on_segment(i, chunks)``, if given, is called as text chunk ``i`` of the
+        normalized ``chunks`` starts producing audio (a server shows progress with it).
         """
+        on_segment = kwargs.get("on_segment")
         speaker_emb, ref_codes = self._resolve_ref(voice, ref_audio, denoise, use_ref_codes)
         chunks, gaps = normalize_to_chunks_v3_with_gaps(text, max_chars=max_chars)
         pauses = gaps_to_silence(gaps)
@@ -679,6 +683,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         sr = self.sample_rate
         last_out: Optional[np.ndarray] = None   # mẩu audio cuối đã phát của chunk trước
         for ci, subs in enumerate(per_chunk):
+            if on_segment is not None:
+                on_segment(ci, chunks)
             first = True
             for sub in subs:
                 if sub is None or len(sub) == 0:
