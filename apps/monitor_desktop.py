@@ -262,6 +262,7 @@ class LogTail:
 
 
 ACCESS_RE = re.compile(r'"(GET|POST|DELETE|PUT) (\S+) HTTP/[\d.]+" (\d{3})')
+MARK = "── "             # the monitor's own marker lines (always shown)
 DONE_RE = re.compile(r" done: ttfa=(\S+) .*?rtf=(\S+)")
 
 
@@ -384,6 +385,7 @@ class Monitor(tk.Tk):
             t.tag_configure("err", foreground=COLORS["bad"])
             t.tag_configure("warn", foreground=COLORS["warn"])
             t.tag_configure("ok", foreground=COLORS["ok"])
+            t.tag_configure("mark", foreground=COLORS["muted"])
             self.nb.add(frame, text=name)
             self.texts[name], self.lines[name] = t, collections.deque(maxlen=5000)
 
@@ -498,6 +500,8 @@ class Monitor(tk.Tk):
         c.create_line(*pts_a, fill=COLORS["accent"], width=2)
 
     def _visible(self, line: str, filt: str) -> bool:
+        if line.startswith(MARK):
+            return True
         if self.hide_health.get() and '/health ' in line:
             return False
         return not filt or filt in line.lower()
@@ -531,6 +535,8 @@ class Monitor(tk.Tk):
 
     @staticmethod
     def _tag(line: str) -> str:
+        if line.startswith(MARK):
+            return "mark"
         l = line.lower()
         if "error" in l or "traceback" in l or " err " in l or "exited" in l or '" 5' in line:
             return "err"
@@ -545,14 +551,18 @@ class Monitor(tk.Tk):
         for name, t in self.texts.items():
             t.delete("1.0", "end")
             for line in self.lines[name]:
-                if not filt or filt in line.lower():
+                if self._visible(line, filt):
                     t.insert("end", line + "\n", self._tag(line))
             t.see("end")
 
     def _clear_logs(self):
+        mark = f"{MARK}cleared at {time.strftime('%H:%M:%S')}, new lines appear below" + (
+            " (/health checks hidden)" if self.hide_health.get() else "") + " ──"
         for name, t in self.texts.items():
             t.delete("1.0", "end")
             self.lines[name].clear()
+            self.lines[name].append(mark)
+            t.insert("end", mark + "\n", "mark")
 
     # actions (in a thread so the UI never blocks)
     def _act(self, label, fn):
