@@ -284,13 +284,15 @@ class R2:
                 return out
             token = root.findtext(self.NS + "NextContinuationToken")
 
-    def get(self, key: str) -> bytes:
+    def get(self, key: str, first_bytes: int = 0) -> bytes:
+        """The object, or only its first ``first_bytes`` (a Range request)."""
+        rng = {"Range": f"bytes=0-{first_bytes - 1}"} if first_bytes else {}
         if self.public:
             url = f"{self.public}/{urllib.parse.quote(key, safe='/-_.~')}"
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "vieneu-monitor"}),
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "vieneu-monitor", **rng}),
                                         timeout=30) as r:
                 return r.read()
-        return self._request("GET", key)
+        return self._request("GET", key, headers=rng)
 
     def put(self, key: str, data: bytes, content_type: str) -> str:
         self._request("PUT", key, body=data, headers={"content-type": content_type}, timeout=120)
@@ -688,9 +690,10 @@ class LibraryTab(_Tab):
 
         tf = ttk.Frame(self, padding=(0, 8, 0, 0))
         tf.pack(fill="both", expand=True)
-        self.tree, sy = self._tree(tf, ("sentences", "codec", "size", "updated"),
-                                   [("world / chapter", 520, "w"), ("sentences", 90, "e"), ("codec", 70, "center"),
-                                    ("size", 90, "e"), ("updated", 150, "w")], height=14)
+        self.tree, sy = self._tree(tf, ("duration", "sentences", "codec", "size", "updated"),
+                                   [("world / chapter", 480, "w"), ("reading time", 100, "e"),
+                                    ("sentences", 80, "e"), ("codec", 60, "center"), ("size", 90, "e"),
+                                    ("updated", 140, "w")], height=14)
         sy.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.tag_configure("world", font=("Segoe UI Semibold", 10), foreground="#e6edf3")
@@ -752,7 +755,17 @@ class LibraryTab(_Tab):
                 ch["link"] = f"{url}/worlds/{w['slug']}/novel?story={ch['id']}"
                 ch["world"] = w
             w["chapters"].sort(key=lambda c: (c["number"], c["modified"]))
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(8) as pool:            # one small header read per chapter
+            list(pool.map(self._measure, [c for w in worlds.values() for c in w["chapters"]]))
         self.after(0, lambda: self._show(site, worlds, len(objects)))
+
+    def _measure(self, ch):
+        try:
+            head = self.r2.get(ch["chunks"][0][1], first_bytes=256) if ch["codec"] == "wav" else b""
+        except Exception:
+            head = b""
+        ch["seconds"], ch["approx"] = chapter_seconds(ch["chunks"], ch["codec"], head)
 
     def _show(self, site, worlds, n_objects):
         if site != self.site.get():
@@ -761,17 +774,22 @@ class LibraryTab(_Tab):
         self.tree.delete(*self.tree.get_children())
         for wid, w in sorted(worlds.items(), key=lambda kv: kv[1]["title"]):
             n = sum(len(c["chunks"]) for c in w["chapters"])
+            secs = sum(c.get("seconds") or 0 for c in w["chapters"])
+            approx = any(c.get("approx") for c in w["chapters"])
             wi = self.tree.insert("", "end", iid=wid, text=f"  {w['title']}", open=True, tags=("world",),
-                                  values=(n, "", "", ""))
+                                  values=(reading_time(secs, approx), n, "", "", ""))
             for ch in w["chapters"]:
                 size = sum(s for _, _, s in ch["chunks"])
                 label = ch["title"] + (f"   ·  {ch['variants']} versions" if ch["variants"] > 1 else "")
                 self.tree.insert(wi, "end", iid=f"{wid}/{ch['id']}", text=f"  {label}",
-                                 values=(len(ch["chunks"]), ch["codec"], f"{size / 1024:.0f} KB",
+                                 values=(reading_time(ch.get("seconds"), ch.get("approx")), len(ch["chunks"]),
+                                         ch["codec"], f"{size / 1024:.0f} KB",
                                          ch["modified"][:16].replace("T", " ")))
         chapters = sum(len(w["chapters"]) for w in worlds.values())
+        total = sum(c.get("seconds") or 0 for w in worlds.values() for c in w["chapters"])
         self.l_status.configure(text=f"{site}: {len(worlds)} worlds · {chapters} narrated chapters · "
-                                     f"{n_objects} objects" if worlds else f"{site}: no narration stored yet")
+                                     f"{reading_time(total)} of audio · {n_objects} objects"
+                                if worlds else f"{site}: no narration stored yet")
 
     def _chapter(self, iid):
         if not iid or "/" not in iid:
@@ -943,7 +961,44 @@ class LibraryTab(_Tab):
         heard = (pos - chapter_samples[0][0]) / rate if chapter_samples else 0
         state = "paused" if self.player.paused else "playing"
         self.l_now.configure(text=f"{ch['world']['title']}  ·  {ch['title']}   —   sentence {idx + 1}/{n}   "
-                                  f"·   {fmt_time(heard)}   ({state})")
+                                  f"·   {fmt_time(heard)} / {reading_time(ch.get('seconds'), ch.get('approx'))}"
+                                  f"   ({state})")
+
+
+def wav_layout(head: bytes):
+    """``(byte_rate, header_bytes)`` of a WAV from its first bytes, or None."""
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos, rate = 12, None
+    while pos + 8 <= len(head):
+        cid, size = head[pos:pos + 4], int.from_bytes(head[pos + 4:pos + 8], "little")
+        if cid == b"fmt " and pos + 20 <= len(head):
+            rate = int.from_bytes(head[pos + 16:pos + 20], "little")       # nAvgBytesPerSec
+        if cid == b"data":
+            return (rate, pos + 8) if rate else None
+        pos += 8 + size + (size & 1)
+    return None
+
+
+def chapter_seconds(chunks, codec: str, head: bytes = b"") -> tuple[float | None, bool]:
+    """Reading time from object sizes: exact for WAV (header of the first chunk; every chunk has
+    the same layout), estimated for Opus from its bitrate. ``(seconds, approximate)``."""
+    if codec == "wav":
+        layout = wav_layout(head)
+        if layout is None:
+            return None, False
+        rate, header = layout
+        return sum(max(0, size - header) for _, _, size in chunks) / rate, False
+    if codec in ("opus", "ogg"):
+        kbps = int(env_value("AUDIO_OPUS_BITRATE_KBPS", "40") or 40)
+        return sum(size for _, _, size in chunks) * 8 / (kbps * 1000), True
+    return None, False
+
+
+def reading_time(seconds, approx: bool = False) -> str:
+    if not seconds:
+        return "–"
+    return ("≈ " if approx else "") + fmt_time(seconds)
 
 
 def group_objects(objects, prefix: str) -> dict:

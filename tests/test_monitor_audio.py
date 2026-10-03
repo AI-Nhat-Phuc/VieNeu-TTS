@@ -71,3 +71,15 @@ def test_player_queues_without_gaps_and_reports_position():
         p.reap()
     assert not p.playing and p.position() == 9600
     p.close()
+
+
+def test_reading_time_from_wav_sizes_and_opus_bitrate():
+    from apps.monitor_audio import chapter_seconds, reading_time, wav_bytes, wav_layout
+    one = wav_bytes(np.zeros(24000, np.int16), 24000)        # 1 s at 24 kHz
+    assert wav_layout(one[:256]) == (48000, 44)
+    chunks = [(0, "a/0.wav", len(one)), (1, "a/1.wav", len(one)), (2, "a/2.wav", 44 + 24000)]
+    assert chapter_seconds(chunks, "wav", one[:256]) == (2.5, False)
+    assert chapter_seconds(chunks, "wav", b"not a wav") == (None, False)
+    secs, approx = chapter_seconds([(0, "a/0.opus", 5000)], "opus")
+    assert approx and secs == pytest.approx(1.0)               # 40 kbit/s default
+    assert reading_time(2.5) == "0:02" and reading_time(3725, True) == "≈ 1:02:05" and reading_time(None) == "–"
