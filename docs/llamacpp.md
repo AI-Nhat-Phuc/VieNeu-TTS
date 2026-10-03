@@ -142,6 +142,27 @@ ones go to a Recent list. The data comes from `GET /debug/activity`, which needs
 the API key (read from `.env`) and answers only on loopback without proxy
 headers, so it is never reachable through the tunnel.
 
+Two audio tabs (`apps/monitor_audio.py`):
+
+- **Studio**: type a text, pick a voice and press Generate. The local server
+  reads it sentence by sentence (playback starts with the first one), the
+  transcript gets each sentence's start time and follows the voice, and a click
+  on a sentence or the waveform plays from there. Save writes WAV + SRT on this
+  machine; Upload puts WAV, SRT and a JSON transcript in the R2 bucket under
+  `manual/<date>/<slug>-<hash>` (`MANUAL_AUDIO_PREFIX`) and copies the URL.
+- **Falevon**: the narration already stored in R2 for production (`audio/`) or
+  staging (`audio-staging/`), grouped by world and chapter with the titles from
+  the site's public novel API. Play runs chapter after chapter without gaps
+  (or stops at the end of one), with sentence progress, seeking, and a link that
+  opens the chapter on Falevon.
+
+R2 settings are read from the environment or `.env`, with the names
+story-services uses: `AUDIO_S3_ENDPOINT`, `AUDIO_S3_BUCKET`,
+`AUDIO_S3_ACCESS_KEY_ID`, `AUDIO_S3_SECRET_ACCESS_KEY`, and optionally
+`AUDIO_PUBLIC_BASE_URL` (download through the public domain) and
+`AUDIO_S3_REGION` (`auto`). Playback uses Windows waveOut, so nothing extra is
+installed.
+
 It also shows:
 
 - server health and active streams

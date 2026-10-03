@@ -1,7 +1,8 @@
 """
 VieNeu-TTS Monitor — a small desktop app (Tkinter, Windows) for a self-hosted
 ``apps/openai_speech.py`` server: an animated Live view of what the server is
-doing (``apps/monitor_live.py``, from ``/debug/activity``), status cards (incl. GPU
+doing (``apps/monitor_live.py``, from ``/debug/activity``), a Studio to make audio by
+hand and the Falevon narration library (``apps/monitor_audio.py``), status cards (incl. GPU
 load / VRAM), a load chart, request counts, the server / tunnel / watchdog logs,
 and buttons to restart things.
 
@@ -31,6 +32,7 @@ import urllib.request
 from ctypes import wintypes
 from tkinter import ttk
 
+from apps.monitor_audio import LibraryTab, StudioTab, style_trees
 from apps.monitor_live import LiveView
 
 HISTORY_S = 300          # chart window
@@ -332,6 +334,7 @@ class Monitor(tk.Tk):
         s.configure("TNotebook.Tab", background=c["panel"], foreground=c["muted"], padding=(14, 5))
         s.map("TNotebook.Tab", background=[("selected", "#2d333b")], foreground=[("selected", c["fg"])])
         s.configure("TEntry", foreground=c["fg"], insertcolor=c["fg"])
+        style_trees(s, c)
 
     def _card(self, parent, col, title):
         f = ttk.Frame(parent, style="Card.TFrame", padding=(12, 8))
@@ -377,6 +380,10 @@ class Monitor(tk.Tk):
         self.live_canvas.pack(fill="both", expand=True)
         self.live = LiveView(self.live_canvas, COLORS, self.args.public_url.split("//")[-1])
         self.tabs.add(live, text="  Live  ")
+        self.studio = StudioTab(self.tabs, COLORS, self.args.local_url, self._key)
+        self.tabs.add(self.studio, text="  Studio  ")
+        self.library = LibraryTab(self.tabs, COLORS)
+        self.tabs.add(self.library, text="  Falevon  ")
         charts = ttk.Frame(self.tabs, padding=(0, 8))
         self.tabs.add(charts, text="  Charts  ")
         mid = ttk.Frame(charts)
