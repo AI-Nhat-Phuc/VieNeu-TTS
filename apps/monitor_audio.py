@@ -239,6 +239,15 @@ class R2:
         self.region = env_value("AUDIO_S3_REGION", "auto")
         self.public = env_value("AUDIO_PUBLIC_BASE_URL").rstrip("/")
 
+    def endpoint_problem(self) -> str:
+        """Why the endpoint cannot be the S3 API, or "" (a bucket's public domain serves files only)."""
+        host = urllib.parse.urlparse(self.endpoint).netloc
+        if host and not host.endswith((".r2.cloudflarestorage.com", ".amazonaws.com")) and                 not host.startswith(("localhost", "127.0.0.1")):
+            return (f"AUDIO_S3_ENDPOINT ({host}) looks like the bucket's public domain, which serves files "
+                    "but cannot list or upload. Use the S3 API URL from Cloudflare → R2 → bucket → Settings "
+                    "(https://<account-id>.r2.cloudflarestorage.com) and put this domain in AUDIO_PUBLIC_BASE_URL.")
+        return ""
+
     def missing(self) -> list[str]:
         return [n for n, v in (("AUDIO_S3_ENDPOINT", self.endpoint), ("AUDIO_S3_BUCKET", self.bucket),
                                ("AUDIO_S3_ACCESS_KEY_ID", self.ak), ("AUDIO_S3_SECRET_ACCESS_KEY", self.sk)) if not v]
@@ -250,7 +259,10 @@ class R2:
         h = sigv4_headers(method, host, path, query, headers or {}, hashlib.sha256(body).hexdigest(), self.ak,
                           self.sk, self.region, dt.datetime.now(dt.timezone.utc))
         url = self.endpoint + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        req = urllib.request.Request(url, data=body if method == "PUT" else None, method=method, headers=h)
+        # urllib's default User-Agent is refused by Cloudflare's browser check (error 1010) on a
+        # custom-domain endpoint; it is not a signed header, so any name works.
+        req = urllib.request.Request(url, data=body if method == "PUT" else None, method=method,
+                                     headers={**h, "User-Agent": "vieneu-monitor/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
 
@@ -412,7 +424,7 @@ class StudioTab(_Tab):
         self.url = tk.StringVar()
         self.e_url = ttk.Entry(bar, textvariable=self.url, width=46, state="readonly")
         self.e_url.pack(side="right", padx=6)
-        self.l_pub = ttk.Label(bar, text="", foreground=C["muted"])
+        self.l_pub = ttk.Label(bar, text="", foreground=C["muted"], wraplength=520)
         self.l_pub.pack(side="right")
         self._wave_cache = None
 
@@ -627,7 +639,7 @@ class StudioTab(_Tab):
                 self.r2.put(base + ".json", meta, "application/json")
                 msg, ok = "uploaded (URL copied)", url
             except Exception as e:
-                msg, ok = f"upload failed: {str(getattr(e, 'code', '') or e)[:70]}", None
+                msg, ok = self.r2.endpoint_problem() or f"upload failed: {str(getattr(e, 'code', '') or e)[:70]}", None
             self.after(0, lambda: self._uploaded(msg, ok))
         threading.Thread(target=run, daemon=True).start()
 
@@ -668,7 +680,7 @@ class LibraryTab(_Tab):
         ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left", padx=6)
         self.auto_next = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Continue into the next chapter", variable=self.auto_next).pack(side="left", padx=12)
-        self.l_status = ttk.Label(bar, text="", foreground=C["muted"])
+        self.l_status = ttk.Label(bar, text="", foreground=C["muted"], wraplength=760)
         self.l_status.pack(side="left", padx=8)
 
         tf = ttk.Frame(self, padding=(0, 8, 0, 0))
@@ -718,7 +730,8 @@ class LibraryTab(_Tab):
         try:
             objects = self.r2.list(prefix)
         except Exception as e:
-            self.after(0, lambda: self.l_status.configure(text=f"R2 listing failed: {str(e)[:90]}"))
+            msg = self.r2.endpoint_problem() or f"R2 listing failed: {str(getattr(e, 'code', '') or e)[:90]}"
+            self.after(0, lambda: self.l_status.configure(text=msg))
             return
         worlds = group_objects(objects, prefix)
         for wid, w in worlds.items():                  # titles and order from the public novel page data
