@@ -379,7 +379,15 @@ with client.audio.speech.with_streaming_response.create(
         play(chunk)
 ```
 
-Endpoints: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v1/voices` (clone from an uploaded clip), `GET /health`. Concurrency is capped per backend (`VIENEU_MAX_STREAMS`, default 16 on GPU / 1 on CPU) with a small queue and `429` beyond it.
+Endpoints: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v1/voices` (clone from an uploaded clip), `GET /health`, `GET /debug/activity` (loopback only, for the monitor). Concurrency is capped per backend (`VIENEU_MAX_STREAMS`, default 16 on GPU / 1 on CPU) with a small queue and `429` beyond it.
+
+#### Desktop monitor (Windows)
+
+```bash
+uv run python -m apps.monitor_desktop
+```
+
+A Tkinter app (no extra packages) for a self-hosted server: health, tunnel and watchdog status, CPU / RAM / GPU / VRAM, a load chart, TTFA / RTF stats and the logs. Its **Live** tab animates each request through the pipeline (text → phonemes → backbone → acoustic head → codec → PCM) with the chunk being spoken and a live waveform, fed by `GET /debug/activity` (API key required, loopback only — never reachable through the tunnel). **Studio** generates audio by hand with a synced transcript, saves WAV + SRT or uploads to R2; **Falevon** browses and plays the narration stored in R2. Details and the R2 settings: [docs/llamacpp.md](docs/llamacpp.md#monitoring-windows-desktop-app).
 
 📊 **[docs/streaming.md](docs/streaming.md)** — every measurement on an RTX 3060 (TTFA / RTF / streams vs `max_streams`), estimates for smaller GPUs, the CPU numbers, and tuning notes (e.g. the first request after the GPU idles pays +100–300 ms until it clocks up).
 
