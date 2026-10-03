@@ -233,8 +233,11 @@ class R2:
     NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
     def __init__(self):
-        self.endpoint = env_value("AUDIO_S3_ENDPOINT").rstrip("/")
         self.bucket = env_value("AUDIO_S3_BUCKET")
+        # Cloudflare's dashboard shows the S3 URL with "/<bucket>" on the end; requests add the bucket
+        # themselves, so only the origin is kept (a doubled bucket fails the signature).
+        u = urllib.parse.urlparse(env_value("AUDIO_S3_ENDPOINT").rstrip("/"))
+        self.endpoint = f"{u.scheme}://{u.netloc}" if u.netloc else ""
         self.ak, self.sk = env_value("AUDIO_S3_ACCESS_KEY_ID"), env_value("AUDIO_S3_SECRET_ACCESS_KEY")
         self.region = env_value("AUDIO_S3_REGION", "auto")
         self.public = env_value("AUDIO_PUBLIC_BASE_URL").rstrip("/")
