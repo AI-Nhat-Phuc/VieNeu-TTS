@@ -83,3 +83,32 @@ def test_reading_time_from_wav_sizes_and_opus_bitrate():
     secs, approx = chapter_seconds([(0, "a/0.opus", 5000)], "opus")
     assert approx and secs == pytest.approx(1.0)               # 40 kbit/s default
     assert reading_time(2.5) == "0:02" and reading_time(3725, True) == "≈ 1:02:05" and reading_time(None) == "–"
+
+
+def test_names_follow_falevon_including_private_and_deleted():
+    from apps.monitor_audio import group_objects, resolve_names
+    site = "https://x"
+    api = {f"{site}/api/worlds/w1/novel": (200, {"title": "Truyện", "world_slug": "truyen",
+                                                 "chapters": [{"story_id": "c1", "title": "Chương 1",
+                                                               "chapter_number": 1}]}),
+           f"{site}/api/stories/c2": (403, None),               # a draft in a public world
+           f"{site}/api/stories/c3": (200, {"title": "Ngoại truyện", "order": 9}),
+           f"{site}/api/worlds/w2/novel": (404, None), f"{site}/api/worlds/w2": (404, None)}
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return api[url]
+    objs = [(f"audio/{w}/{c}/h/0.wav", 100, "2026-10-02T00:00:00Z")
+            for w, c in (("w1", "c2"), ("w1", "c1"), ("w1", "c3"), ("w2", "c9"))]
+    worlds = group_objects(objs, "audio/")
+    for w in worlds.values():
+        resolve_names(w, site, fetch)
+    w1, w2 = worlds["w1"], worlds["w2"]
+    assert (w1["title"], w1["state"]) == ("Truyện", "ok")
+    assert [(c["title"], c["state"]) for c in w1["chapters"]] == [
+        ("Chương 1", "ok"), ("Ngoại truyện", "ok"), ("private chapter · c2", "private")]
+    assert w1["chapters"][0]["link"] == "https://x/worlds/truyen/novel?story=c1"
+    assert w2["state"] == "deleted" and w2["title"] == "deleted world · w2"
+    assert w2["chapters"][0]["state"] == "deleted" and w2["chapters"][0]["link"] == ""
+    assert f"{site}/api/stories/c9" not in calls             # a deleted world's chapters are not looked up

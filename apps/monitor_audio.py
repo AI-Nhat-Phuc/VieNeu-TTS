@@ -30,6 +30,7 @@ import threading
 import time
 import tkinter as tk
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -685,6 +686,9 @@ class LibraryTab(_Tab):
         ttk.Button(bar, text="Refresh", command=self.refresh).pack(side="left", padx=6)
         self.auto_next = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Continue into the next chapter", variable=self.auto_next).pack(side="left", padx=12)
+        self.show_deleted = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Show deleted", variable=self.show_deleted,
+                        command=lambda: self.worlds and self._show(self.site.get(), self.worlds, 0)).pack(side="left")
         self.l_status = ttk.Label(bar, text="", foreground=C["muted"], wraplength=760)
         self.l_status.pack(side="left", padx=8)
 
@@ -697,6 +701,9 @@ class LibraryTab(_Tab):
         sy.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.tag_configure("world", font=("Segoe UI Semibold", 10), foreground="#e6edf3")
+        self.tree.tag_configure("deleted", foreground="#6e7681")
+        self.tree.tag_configure("private", foreground=C["warn"])
+        self.tree.tag_configure("unknown", foreground=C["muted"])
         self.tree.tag_configure("playing", background="#1f3a2a", foreground="#7ee787")
         self.tree.bind("<Double-1>", lambda e: self._play_selected())
 
@@ -740,24 +747,10 @@ class LibraryTab(_Tab):
             self.after(0, lambda: self.l_status.configure(text=msg))
             return
         worlds = group_objects(objects, prefix)
-        for wid, w in worlds.items():                  # titles and order from the public novel page data
-            try:
-                d = http_get_json(f"{url}/api/worlds/{wid}/novel", 8).get("data") or {}
-            except Exception:
-                d = {}
-            w["title"] = d.get("title") or f"world {wid[:8]}"
-            w["slug"] = d.get("world_slug") or wid
-            meta = {c.get("story_id"): c for c in d.get("chapters") or []}
-            for ch in w["chapters"]:
-                m = meta.get(ch["id"], {})
-                ch["title"] = m.get("title") or f"chapter {ch['id'][:8]}"
-                ch["number"] = m.get("chapter_number") or 10_000
-                ch["link"] = f"{url}/worlds/{w['slug']}/novel?story={ch['id']}"
-                ch["world"] = w
-            w["chapters"].sort(key=lambda c: (c["number"], c["modified"]))
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(8) as pool:            # one small header read per chapter
-            list(pool.map(self._measure, [c for w in worlds.values() for c in w["chapters"]]))
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(lambda w: resolve_names(w, url, fetch_status), worlds.values()))
+            list(pool.map(self._measure, [c for w in worlds.values() for c in w["chapters"]]))   # header reads
         self.after(0, lambda: self._show(site, worlds, len(objects)))
 
     def _measure(self, ch):
@@ -772,23 +765,35 @@ class LibraryTab(_Tab):
             return
         self.worlds = worlds
         self.tree.delete(*self.tree.get_children())
-        for wid, w in sorted(worlds.items(), key=lambda kv: kv[1]["title"]):
+        hidden = {wid for wid, w in worlds.items() if w["state"] == "deleted" and not self.show_deleted.get()}
+        order = sorted(worlds.items(), key=lambda kv: (STATE_RANK[kv[1]["state"]], kv[1]["title"].lower()))
+        for wid, w in order:
+            if wid in hidden:
+                continue
             n = sum(len(c["chunks"]) for c in w["chapters"])
             secs = sum(c.get("seconds") or 0 for c in w["chapters"])
             approx = any(c.get("approx") for c in w["chapters"])
-            wi = self.tree.insert("", "end", iid=wid, text=f"  {w['title']}", open=True, tags=("world",),
+            wi = self.tree.insert("", "end", iid=wid, text=f"  {w['title']}", open=w["state"] == "ok",
+                                  tags=("world",) if w["state"] == "ok" else ("world", w["state"]),
                                   values=(reading_time(secs, approx), n, "", "", ""))
             for ch in w["chapters"]:
                 size = sum(s for _, _, s in ch["chunks"])
                 label = ch["title"] + (f"   ·  {ch['variants']} versions" if ch["variants"] > 1 else "")
                 self.tree.insert(wi, "end", iid=f"{wid}/{ch['id']}", text=f"  {label}",
+                                 tags=() if ch["state"] == "ok" else (ch["state"],),
                                  values=(reading_time(ch.get("seconds"), ch.get("approx")), len(ch["chunks"]),
                                          ch["codec"], f"{size / 1024:.0f} KB",
                                          ch["modified"][:16].replace("T", " ")))
-        chapters = sum(len(w["chapters"]) for w in worlds.values())
-        total = sum(c.get("seconds") or 0 for w in worlds.values() for c in w["chapters"])
-        self.l_status.configure(text=f"{site}: {len(worlds)} worlds · {chapters} narrated chapters · "
-                                     f"{reading_time(total)} of audio · {n_objects} objects"
+        shown = [w for wid, w in worlds.items() if wid not in hidden]
+        chapters = sum(len(w["chapters"]) for w in shown)
+        total = sum(c.get("seconds") or 0 for w in shown for c in w["chapters"])
+        note = ""
+        if hidden:
+            gone = sum(c.get("seconds") or 0 for wid in hidden for c in worlds[wid]["chapters"])
+            note = (f"   ·   {len(hidden)} worlds deleted on Falevon hidden "
+                    f"({sum(len(worlds[wid]['chapters']) for wid in hidden)} chapters, {reading_time(gone)} still in R2)")
+        self.l_status.configure(text=f"{site}: {len(shown)} worlds · {chapters} narrated chapters · "
+                                     f"{reading_time(total)} of audio{note}"
                                 if worlds else f"{site}: no narration stored yet")
 
     def _chapter(self, iid):
@@ -887,8 +892,10 @@ class LibraryTab(_Tab):
         if ch is None:
             sel = self.tree.selection()
             ch = self._chapter(sel[0]) if sel else None
-        if ch:
+        if ch and ch.get("link"):
             webbrowser.open(ch["link"])
+        elif ch:
+            self.l_status.configure(text=f"{ch['title']} is not on Falevon any more")
 
     def _mark_playing(self, ch):
         for iid in self.tree.tag_has("playing"):
@@ -999,6 +1006,56 @@ def reading_time(seconds, approx: bool = False) -> str:
     if not seconds:
         return "–"
     return ("≈ " if approx else "") + fmt_time(seconds)
+
+
+STATE_RANK = {"ok": 0, "private": 1, "unknown": 2, "deleted": 3}
+
+
+def fetch_status(url: str, timeout: float = 8.0):
+    """``(http status, data)`` of a Falevon API call; status 0 when the site did not answer."""
+    try:
+        return 200, http_get_json(url, timeout).get("data") or {}
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return 0, None
+
+
+def _state(status: int) -> str:
+    # story-creator answers 404 only for what does not exist; a private world or a draft is 403.
+    return {200: "ok", 403: "private", 401: "private", 404: "deleted"}.get(status, "unknown")
+
+
+def resolve_names(world: dict, site: str, fetch) -> None:
+    """Titles, order, links and state ("ok" / "private" / "deleted" / "unknown") of a world and its
+    narrated chapters, from the site's public API: the novel's table of contents first, then
+    ``/api/worlds/<id>`` and ``/api/stories/<id>`` for whatever the contents do not list."""
+    wid = world["id"]
+    status, novel = fetch(f"{site}/api/worlds/{wid}/novel")
+    if status != 200:
+        status, info = fetch(f"{site}/api/worlds/{wid}")
+        novel = {"title": (info or {}).get("name"), "world_slug": (info or {}).get("slug")} if status == 200 else {}
+    world["state"] = _state(status)
+    labels = {"private": "private world", "deleted": "deleted world", "unknown": "world (site unreachable)"}
+    world["title"] = (novel or {}).get("title") or f"{labels.get(world['state'], 'world')} · {wid[:8]}"
+    world["slug"] = (novel or {}).get("world_slug") or wid
+    contents = {c.get("story_id"): c for c in (novel or {}).get("chapters") or []}
+    clabels = {"private": "private chapter", "deleted": "deleted chapter", "unknown": "chapter (site unreachable)"}
+    for ch in world["chapters"]:
+        ch["world"] = world
+        m = contents.get(ch["id"])
+        if m is not None:
+            st = 200
+        elif world["state"] == "deleted":
+            st = 404                                   # the world is gone, so are its chapters
+        else:
+            st, story = fetch(f"{site}/api/stories/{ch['id']}")
+            m = story if st == 200 else None
+        ch["state"] = _state(st)
+        ch["title"] = (m or {}).get("title") or f"{clabels.get(ch['state'], 'chapter')} · {ch['id'][:8]}"
+        ch["number"] = (m or {}).get("chapter_number") or (m or {}).get("order") or 10_000
+        ch["link"] = f"{site}/worlds/{world['slug']}/novel?story={ch['id']}" if ch["state"] != "deleted" else ""
+    world["chapters"].sort(key=lambda c: (STATE_RANK[c["state"]], c["number"], c["modified"]))
 
 
 def group_objects(objects, prefix: str) -> dict:
