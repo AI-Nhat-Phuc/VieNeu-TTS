@@ -6,7 +6,9 @@ Studio   write a text, have the local server read it sentence by sentence, liste
          machine or upload them to the R2 bucket.
 Falevon  the narration Falevon has already stored in R2 (production ``audio/``
          and staging ``audio-staging/``), grouped by world and chapter, played
-         chapter after chapter without gaps, with a link to each chapter.
+         chapter after chapter without gaps, with a link to each chapter and a
+         transcript (the chapter's text from the site, split like story-services
+         splits it, so line i is clip i) that follows the voice.
 
 Playback uses the Windows waveOut API through ctypes (gapless queueing and a
 real play position, no extra packages); R2 is spoken to with SigV4 over urllib.
@@ -692,14 +694,39 @@ class LibraryTab(_Tab):
         self.l_status = ttk.Label(bar, text="", foreground=C["muted"], wraplength=760)
         self.l_status.pack(side="left", padx=8)
 
-        tf = ttk.Frame(self, padding=(0, 8, 0, 0))
-        tf.pack(fill="both", expand=True)
+        panes = ttk.Panedwindow(self, orient="horizontal")
+        panes.pack(fill="both", expand=True, pady=(8, 0))
+        tf = ttk.Frame(panes)
         self.tree, sy = self._tree(tf, ("duration", "sentences", "codec", "size", "updated"),
-                                   [("world / chapter", 480, "w"), ("reading time", 100, "e"),
-                                    ("sentences", 80, "e"), ("codec", 60, "center"), ("size", 90, "e"),
-                                    ("updated", 140, "w")], height=14)
+                                   [("world / chapter", 340, "w"), ("reading time", 90, "e"),
+                                    ("sentences", 70, "e"), ("codec", 50, "center"), ("size", 70, "e"),
+                                    ("updated", 120, "w")], height=14)
         sy.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_transcript(self._chapter(
+            (self.tree.selection() or ("",))[0])))
+        panes.add(tf, weight=3)
+
+        trf = ttk.Frame(panes, padding=(10, 0, 0, 0))
+        self.l_tr = ttk.Label(trf, text="Transcript (click a line to play from there)", foreground=C["muted"])
+        self.l_tr.pack(anchor="w")
+        box = ttk.Frame(trf)
+        box.pack(fill="both", expand=True, pady=(2, 0))
+        self.tr = self._text(box, width=40, cursor="arrow", spacing1=2, spacing3=4)
+        ty = ttk.Scrollbar(box, orient="vertical", command=self.tr.yview)
+        self.tr.configure(yscrollcommand=ty.set, state="disabled")
+        ty.pack(side="right", fill="y")
+        self.tr.pack(fill="both", expand=True)
+        self.tr.tag_configure("title", font=("Segoe UI Semibold", 12))
+        self.tr.tag_configure("note", foreground=C["muted"], font=("Segoe UI", 10, "italic"))
+        self.tr.tag_configure("now", background="#1f3a2a", foreground="#7ee787")
+        self.tr.tag_configure("heard", foreground=C["muted"])
+        self.tr.tag_raise("now")
+        self.tr.bind("<Button-1>", self._transcript_click)
+        panes.add(trf, weight=2)
+        self.transcripts: dict = {}      # chapter id -> (sentences, problem); None while loading
+        self.tr_chapter = None           # the chapter the transcript shows
+        self.tr_line = -1                # its highlighted sentence
         self.tree.tag_configure("world", font=("Segoe UI Semibold", 10), foreground="#e6edf3")
         self.tree.tag_configure("deleted", foreground="#6e7681")
         self.tree.tag_configure("private", foreground=C["warn"])
@@ -803,6 +830,73 @@ class LibraryTab(_Tab):
         wid, cid = iid.split("/", 1)
         return next((c for c in self.worlds.get(wid, {}).get("chapters", []) if c["id"] == cid), None)
 
+    # transcript ---------------------------------------------------------------
+    def _show_transcript(self, ch):
+        if ch is None or ch is self.tr_chapter:
+            return
+        self.tr_chapter, self.tr_line = ch, -1
+        if ch["id"] not in self.transcripts:
+            self.transcripts[ch["id"]] = None
+            threading.Thread(target=self._load_transcript, args=(ch,), daemon=True).start()
+        self._render_transcript()
+
+    def _load_transcript(self, ch):
+        site = ch["world"].get("site")
+        result = (chapter_transcript(site, ch["id"], fetch_status) if site and ch["state"] != "deleted"
+                  else ([], "the chapter is gone from the site"))
+        self.transcripts[ch["id"]] = result
+        self.after(0, lambda: ch is self.tr_chapter and self._render_transcript())
+
+    def _render_transcript(self):
+        ch = self.tr_chapter
+        t = self.tr
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        got = self.transcripts.get(ch["id"])
+        if got is None:
+            t.insert("end", "loading the text from Falevon…", "note")
+            head = f"Transcript · {ch['title']}"
+        elif not got[0]:
+            t.insert("end", f"No transcript: {got[1]}.", "note")
+            head = f"Transcript · {ch['title']}"
+        else:
+            sentences, n = got[0], len(ch["chunks"])
+            for i, s in enumerate(sentences):
+                t.insert("end", s + ("\n" if i < len(sentences) - 1 else ""), ("title",) if i == 0 else ())
+            head = (f"Transcript · {len(sentences)} lines (click one to play from there)" if len(sentences) == n else
+                    f"Transcript · {len(sentences)} lines for {n} clips: the text changed since it was narrated, "
+                    f"so lines may not match the voice")
+        self.l_tr.configure(text=head)
+        t.configure(state="disabled")
+        self.tr_line = -1
+        cur = self._current() if self.player.h else None
+        if cur and cur[2] is ch:
+            self._highlight(cur[3])
+
+    def _highlight(self, idx: int):
+        got = self.transcripts.get(self.tr_chapter["id"]) if self.tr_chapter else None
+        if idx == self.tr_line or not got or not got[0]:
+            return
+        self.tr_line = idx
+        t = self.tr
+        t.tag_remove("now", "1.0", "end")
+        t.tag_remove("heard", "1.0", "end")
+        if idx < 0:
+            return
+        line = min(idx, len(got[0]) - 1) + 1
+        if line > 1:
+            t.tag_add("heard", "1.0", f"{line}.0")
+        t.tag_add("now", f"{line}.0", f"{line}.end")
+        t.see(f"{line}.0")
+
+    def _transcript_click(self, e):
+        ch, got = self.tr_chapter, self.transcripts.get(self.tr_chapter["id"]) if self.tr_chapter else None
+        if ch is None or not got or not got[0] or not ch["chunks"]:
+            return "break"
+        line = int(self.tr.index(f"@{e.x},{e.y}").split(".")[0])
+        self._play(ch, min(line - 1, len(ch["chunks"]) - 1))
+        return "break"
+
     # playback -----------------------------------------------------------------
     def _play_selected(self):
         sel = self.tree.selection()
@@ -857,6 +951,7 @@ class LibraryTab(_Tab):
         self.player.close()
         self.timeline = []
         self._mark_playing(None)
+        self._highlight(-1)
 
     def _next(self):
         cur = self._current()
@@ -952,6 +1047,9 @@ class LibraryTab(_Tab):
         if ch is not self.now_chapter or not self.tree.tag_has("playing"):
             self.now_chapter = ch
             self._mark_playing(ch)
+            self._show_transcript(ch)
+        if self.tr_chapter is ch:
+            self._highlight(idx)
         n = len(ch["chunks"])
         loaded = {i for _, _, c2, i in self.timeline if c2 is ch}
         frac = (pos - cur[0]) / max(1, cur[1] - cur[0])
@@ -1035,7 +1133,7 @@ def resolve_names(world: dict, site: str, fetch) -> None:
     if status != 200:
         status, info = fetch(f"{site}/api/worlds/{wid}")
         novel = {"title": (info or {}).get("name"), "world_slug": (info or {}).get("slug")} if status == 200 else {}
-    world["state"] = _state(status)
+    world["state"], world["site"] = _state(status), site
     labels = {"private": "private world", "deleted": "deleted world", "unknown": "world (site unreachable)"}
     world["title"] = (novel or {}).get("title") or f"{labels.get(world['state'], 'world')} · {wid[:8]}"
     world["slug"] = (novel or {}).get("world_slug") or wid
@@ -1056,6 +1154,78 @@ def resolve_names(world: dict, site: str, fetch) -> None:
         ch["number"] = (m or {}).get("chapter_number") or (m or {}).get("order") or 10_000
         ch["link"] = f"{site}/worlds/{world['slug']}/novel?story={ch['id']}" if ch["state"] != "deleted" else ""
     world["chapters"].sort(key=lambda c: (STATE_RANK[c["state"]], c["number"], c["modified"]))
+
+
+# What story-services reads aloud, rebuilt from the chapter as the site serves it:
+# story-creator's ``strip_markup`` then story-services' ``chapter_sentences`` (title
+# first, sentences cut to AUDIO_MAX_SENTENCE_CHARS), so line i is clip i in R2.
+_ZW_RE = re.compile("[​‌⁠⁣﻿]")          # the site's watermark bits
+_MARKUP = [(re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S), " "), (re.compile(r"<br\s*/?>", re.I), "\n"),
+           (re.compile(r"</(p|div|h[1-6]|li|blockquote|section|article)>", re.I), "\n\n"), (re.compile(r"<[^>]+>"), "")]
+_MD = [(re.compile(r"!\[[^\]]*\]\([^)]*\)"), ""), (re.compile(r"\[([^\]]*)\]\([^)]*\)"), r"\1"),
+       (re.compile(r"^\s{0,3}#{1,6}\s+", re.M), ""), (re.compile(r"^\s{0,3}>\s?", re.M), ""),
+       (re.compile(r"(\*{1,3}|_{1,3}|~~|`+)"), "")]
+_ENTITIES = {"&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&apos;": "'",
+             "&hellip;": "…", "&mdash;": "—", "&ndash;": "–"}
+
+
+def strip_markup(text: str, fmt: str = "plain") -> str:
+    out = _ZW_RE.sub("", text or "")
+    if fmt == "html" or "<" in out:
+        for rx, rep in _MARKUP:
+            out = rx.sub(rep, out)
+        for entity, char in _ENTITIES.items():
+            out = out.replace(entity, char)
+    if fmt in ("markdown", "md", "html") or "](" in out or "#" in out:
+        for rx, rep in _MD:
+            out = rx.sub(rep, out)
+    out = re.sub(r"[ \t ]+", " ", out.replace("\r\n", "\n").replace("\r", "\n"))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(line.strip() for line in out.split("\n"))).strip()
+
+
+def narrated_sentences(title: str, text: str, max_chars: int = 160, min_chars: int = 2) -> list[str]:
+    units = []
+    for u in re.split(r"(?<=[.!?…。！？])\s+", re.sub(r"\s*\n+\s*", " ", text).strip()):
+        if not u.strip():
+            continue
+        if units and re.match(r"^['\"”’)\]]+", u):                  # a stray closing quote goes back
+            units[-1] = f"{units[-1]} {u.strip()}"
+        else:
+            units.append(u.strip())
+    merged = []
+    for u in units:
+        if merged and (len(u) < min_chars or len(merged[-1]) < min_chars):
+            merged[-1] = f"{merged[-1]} {u}"
+        else:
+            merged.append(u)
+    pieces = []
+    for u in merged:
+        if len(u) <= max_chars:
+            pieces.append(u)
+            continue
+        cut: list[str] = []
+        for clause in re.split(r"(?<=[,;:—–])\s+", u):
+            for part in clause.split() if len(clause) > max_chars else [clause]:
+                if cut and len(cut[-1]) + 1 + len(part) <= max_chars:
+                    cut[-1] = f"{cut[-1]} {part}"
+                else:
+                    cut.append(part)
+        pieces += cut
+    title = " ".join((title or "").split())
+    return ([title] if title else []) + pieces
+
+
+def chapter_transcript(site: str, chapter_id: str, fetch) -> tuple[list[str], str]:
+    """``(sentences, problem)`` of a chapter from ``/api/stories/<id>``."""
+    status, story = fetch(f"{site}/api/stories/{chapter_id}")
+    if status != 200:
+        return [], {403: "the chapter is private", 404: "the chapter is gone from the site",
+                    0: "the site did not answer"}.get(status, f"the site answered {status}")
+    if not story.get("content"):
+        return [], "the site withholds this chapter's text (early access)"
+    max_chars = int(env_value("AUDIO_MAX_SENTENCE_CHARS", "160") or 160)
+    return narrated_sentences(story.get("title") or "", strip_markup(story["content"], story.get("format") or "plain"),
+                              max_chars), ""
 
 
 def group_objects(objects, prefix: str) -> dict:

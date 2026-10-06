@@ -154,7 +154,12 @@ Two audio tabs (`apps/monitor_audio.py`):
   staging (`audio-staging/`), grouped by world and chapter with the titles from
   the site's public novel API. Play runs chapter after chapter without gaps
   (or stops at the end of one), with sentence progress, seeking, and a link that
-  opens the chapter on Falevon.
+  opens the chapter on Falevon. Beside the list, a transcript follows the voice:
+  the chapter's text from `/api/stories/<id>`, split the way story-services
+  splits it for narration (title first, `AUDIO_MAX_SENTENCE_CHARS`, default
+  160), so line *i* is clip *i*; click a line to play from there. When the text
+  was edited after narration the line count differs and the header says so;
+  private, deleted and early-access chapters say why there is no text.
 
 R2 settings are read from the environment or `.env`, with the names
 story-services uses: `AUDIO_S3_ENDPOINT`, `AUDIO_S3_BUCKET`,

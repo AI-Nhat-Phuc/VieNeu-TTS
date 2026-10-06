@@ -9,8 +9,8 @@ import pytest
 
 pytest.importorskip("tkinter")
 
-from apps.monitor_audio import (WavePlayer, group_objects, sigv4_headers, slugify, split_sentences,
-                                to_srt)
+from apps.monitor_audio import (WavePlayer, chapter_transcript, group_objects, narrated_sentences, sigv4_headers,
+                                slugify, split_sentences, strip_markup, to_srt)
 
 
 def test_sentences_follow_punctuation_and_paragraphs():
@@ -112,3 +112,22 @@ def test_names_follow_falevon_including_private_and_deleted():
     assert w2["state"] == "deleted" and w2["title"] == "deleted world · w2"
     assert w2["chapters"][0]["state"] == "deleted" and w2["chapters"][0]["link"] == ""
     assert f"{site}/api/stories/c9" not in calls             # a deleted world's chapters are not looked up
+
+
+def test_transcript_lines_are_the_narrated_sentences():
+    body = "<p>**Mưa** rơi.​‌ Anh nói: \"Ừ.\" Rồi đi.</p><p>[Hết](http://x)!</p>"   # watermark bits too
+    assert strip_markup(body, "html") == 'Mưa rơi. Anh nói: "Ừ." Rồi đi.\n\nHết!'
+    assert narrated_sentences("  Chương   1 ", strip_markup(body, "html")) == [
+        "Chương 1", "Mưa rơi.", 'Anh nói: "Ừ." Rồi đi.', "Hết!"]   # a quote ending in . does not cut
+    long = ", ".join(["một đoạn khá dài"] * 20) + "."
+    assert all(len(s) <= 160 for s in narrated_sentences("", long))
+
+
+def test_transcript_says_why_it_is_missing():
+    pages = {"https://f/api/stories/a": (200, {"title": "T", "content": "Một. Hai.", "format": "plain"}),
+             "https://f/api/stories/b": (200, {"title": "T", "content": "", "secure_content": True}),
+             "https://f/api/stories/c": (403, None)}
+    fetch = pages.__getitem__
+    assert chapter_transcript("https://f", "a", fetch) == (["T", "Một.", "Hai."], "")
+    assert chapter_transcript("https://f", "b", fetch)[1].endswith("(early access)")
+    assert chapter_transcript("https://f", "c", fetch) == ([], "the chapter is private")
