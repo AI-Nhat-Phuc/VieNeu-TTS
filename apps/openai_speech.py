@@ -65,6 +65,7 @@ import base64
 import collections
 import hmac
 import io
+import itertools
 import json
 import logging
 import os
@@ -133,6 +134,8 @@ class Engine:
         self.sched = self.tts._get_stream_scheduler() if self.backend == "pytorch" else None
         lite = getattr(self.tts, "engine", None)
         lite_sched, batcher = getattr(lite, "sched", None), getattr(lite, "batcher", None)
+        self._lite_runner = lite_sched or batcher
+        self._exiting = False
         if self.sched is not None:
             self.max_streams = self.sched.B
         else:
@@ -176,9 +179,27 @@ class Engine:
         self._gate.release()
 
     def stream_error(self) -> Optional[BaseException]:
-        """Why the GPU stream scheduler died, or None. A dead scheduler refuses
-        every request until the process restarts."""
-        return getattr(self.sched, "error", None) if self.sched is not None else None
+        """Why the GPU stream scheduler (or the llama.cpp backbone) died, or None.
+        Neither recovers: every request is refused until the process restarts."""
+        if self.sched is not None:
+            return getattr(self.sched, "error", None)
+        bb = getattr(self._lite_runner, "bb", None)
+        return getattr(bb, "fault", None)
+
+    def exit_if_broken(self) -> None:
+        """A dead engine only answers 503, so exit and let the supervisor (the
+        watchdog, a container restart policy) bring up a fresh process.
+        VIENEU_EXIT_ON_FAULT=0 keeps the process up, refusing requests."""
+        err = self.stream_error()
+        if err is None or os.environ.get("VIENEU_EXIT_ON_FAULT", "1") == "0":
+            return
+        with self._lock:
+            if self._exiting:
+                return
+            self._exiting = True
+        log.critical("💥 speech engine is down (%r); exiting in 2 s so the supervisor restarts it", err)
+        # os._exit: a graceful shutdown could block on the crashed native backend.
+        threading.Timer(2.0, os._exit, (70,)).start()
 
     def voices(self) -> list:
         out = []
@@ -422,6 +443,7 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
         state = "done"
     except Exception as e:  # noqa: BLE001 - recorded for the monitor, then re-raised
         state, error = "error", repr(e)[:200]
+        eng.exit_if_broken()
         raise
     finally:
         ACTIVITY.finish(rid, state, error)
@@ -467,7 +489,7 @@ def speech(req: SpeechRequest, request: Request = None):
         raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
     if eng.stream_error() is not None:
         # Say so now: once the 200 headers are out, a failure only truncates the body.
-        raise HTTPException(503, "speech engine is down; restart the server (see /health)")
+        raise HTTPException(503, "speech engine is down; it is restarting (see /health)")
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     rec = ACTIVITY.start(rid, req, request)
     try:
@@ -482,15 +504,25 @@ def speech(req: SpeechRequest, request: Request = None):
     # before the body is read, the slot is freed when the body is dropped.
     weakref.finalize(chunks, slot.release)
     weakref.finalize(chunks, ACTIVITY.finish, rid, "cancelled")   # no-op once the stream finished
+    # Wait for the first audio before sending headers: a request that fails
+    # before producing any (a crashed backbone, a bad voice file) gets a real
+    # error status instead of an empty 200.
+    try:
+        head = next(chunks, None)
+    except Exception as e:  # noqa: BLE001 - logged by the engine; mapped to a status here
+        if eng.stream_error() is not None:
+            raise HTTPException(503, "speech engine is down; it is restarting") from e
+        raise HTTPException(500, f"speech generation failed: {type(e).__name__}") from e
+    body = chunks if head is None else itertools.chain((head,), chunks)
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
     ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
     if req.stream_format == "sse":
-        return StreamingResponse(_sse_body(chunks, fmt, req.sample_rate),
+        return StreamingResponse(_sse_body(body, fmt, req.sample_rate),
                                  media_type="text/event-stream", headers=headers)
     media = "audio/wav" if fmt == "wav" else "audio/pcm"
-    return StreamingResponse(_audio_body(chunks, fmt, req.sample_rate), media_type=media, headers=headers)
+    return StreamingResponse(_audio_body(body, fmt, req.sample_rate), media_type=media, headers=headers)
 
 
 # ── discovery ────────────────────────────────────────────────────────────────

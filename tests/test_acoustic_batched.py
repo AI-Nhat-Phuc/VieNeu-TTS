@@ -143,6 +143,7 @@ class FakeEngine:
 class FakeBackbone:
     """Hidden state from the row's own content only (batch-independent)."""
     n_batch = 4096
+    fault = None
 
     def __init__(self, n_seq_max=3):
         self.n_seq_max, self.calls = n_seq_max, []
@@ -186,6 +187,30 @@ def test_scheduler_streams_match_solo_runs_and_free_their_slots(head):
             break
         threading.Event().wait(0.02)
     assert sorted(sched._free) == [0, 1, 2]
+
+
+def test_scheduler_fails_streams_on_a_backbone_fault_and_refuses_new_ones(head):
+    class Crashing(FakeBackbone):
+        def decode(self, rows):
+            self.fault = RuntimeError("native crash")
+            raise self.fault
+
+    eng, bb = FakeEngine(), Crashing(n_seq_max=2)
+    sched = FrameScheduler(eng, head[0], bb)
+    prompt, anchor = np.ones((3, H), np.float32), np.zeros(H, np.float32)
+    greedy = (0.0, 0, 1.0, 1.0, None)
+    with pytest.raises(RuntimeError, match="native crash"):
+        list(sched.generate(prompt, anchor, greedy, 5))
+    assert sched.error is bb.fault
+    for _ in range(100):                                      # its sequence was freed
+        if len(sched._free) == 2:
+            break
+        threading.Event().wait(0.02)
+    assert sorted(sched._free) == [0, 1]
+    calls = len(bb.calls)
+    with pytest.raises(RuntimeError, match="native crash"):   # refused up front
+        list(sched.generate(prompt, anchor, greedy, 5))
+    assert len(bb.calls) == calls
 
 
 def _ref_sample(logits, t, k, p, r, prev):

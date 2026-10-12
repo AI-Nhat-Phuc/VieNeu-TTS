@@ -166,3 +166,56 @@ def test_activity_is_not_served_through_a_tunnel(client, monkeypatch):
     # cloudflared connects from loopback too; its headers give it away.
     assert client.get("/debug/activity", headers={"CF-Connecting-IP": "1.2.3.4"}).status_code == 404
     assert client.get("/debug/activity", headers={"X-Forwarded-For": "1.2.3.4"}).status_code == 404
+
+
+@pytest.fixture
+def exits(monkeypatch):
+    """Records the scheduled process exit instead of running it."""
+    seen = []
+
+    class Timer:
+        def __init__(self, delay, fn, args=()):
+            seen.append((fn, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(api.threading, "Timer", Timer)
+    return seen
+
+
+def test_backbone_crash_returns_503_and_restarts_the_process(client, eng, exits):
+    lite_bb = SimpleNamespace(fault=None)
+    eng._lite_runner = SimpleNamespace(bb=lite_bb)
+
+    def crash(text, **kw):
+        lite_bb.fault = RuntimeError("llama_decode crashed in native code")
+        raise lite_bb.fault
+        yield
+
+    eng.tts.infer_stream = crash
+    r = _speech(client)
+    assert r.status_code == 503                # not an empty 200
+    assert client.get("/health").status_code == 503
+    assert exits == [(api.os._exit, (70,))]    # once, however many requests saw it
+    assert _speech(client).status_code == 503
+    assert len(exits) == 1
+    assert eng.active == 0
+
+
+def test_exit_on_fault_can_be_disabled(client, eng, exits, monkeypatch):
+    monkeypatch.setenv("VIENEU_EXIT_ON_FAULT", "0")
+    eng.sched = SimpleNamespace(error=RuntimeError("worker died"))
+    eng.exit_if_broken()
+    assert exits == []
+
+
+def test_failure_before_any_audio_is_a_500(client, eng, exits):
+    def bad(text, **kw):
+        raise ValueError("bad voice file")
+        yield
+
+    eng.tts.infer_stream = bad
+    r = _speech(client)
+    assert r.status_code == 500 and "ValueError" in r.json()["error"]["message"]
+    assert exits == [] and eng.active == 0
