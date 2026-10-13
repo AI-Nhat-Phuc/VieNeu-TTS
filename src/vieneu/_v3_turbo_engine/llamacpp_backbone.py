@@ -30,6 +30,13 @@ import numpy as np
 _PAD = 512
 
 
+class BackboneFault(RuntimeError):
+    """llama.cpp threw a native (C++) exception mid-decode — on Windows an
+    ``OSError`` 0xe06d7363 from ctypes, typically a Vulkan device-lost or
+    out-of-memory error. The context is half-updated and the device may be gone,
+    so the backbone refuses every later call; only a process restart recovers."""
+
+
 class _ModelParams(C.Structure):
     _fields_ = [("devices", C.c_void_p), ("tensor_buft_overrides", C.c_void_p),
                 ("n_gpu_layers", C.c_int32), ("_pad", C.c_uint8 * _PAD)]
@@ -175,9 +182,16 @@ class LlamaBackbone:
         self.n_batch = int(n_batch)
         self._batch = L.llama_batch_init(self.n_batch, self.H, 1)
         self._lock = threading.Lock()
+        self.fault: Optional[BackboneFault] = None
+
+    def _check(self) -> None:
+        if self.fault is not None:
+            raise self.fault
 
     def reset(self, seq: int) -> None:
         with self._lock:
+            if self.fault is not None:   # nothing left to clear; the caller is just freeing the slot
+                return
             self.L.llama_memory_seq_rm(self.mem, int(seq), -1, -1)
 
     def decode(self, rows: Sequence[Tuple[int, np.ndarray, int]]) -> np.ndarray:
@@ -188,6 +202,7 @@ class LlamaBackbone:
         flat = np.ascontiguousarray(np.concatenate([e for _, e, _ in rows], 0), dtype=np.float32)
         # The batch buffer is shared, so filling it is part of the critical section.
         with self._lock:
+            self._check()
             b = self._batch
             C.memmove(b.embd, flat.ctypes.data, flat.nbytes)
             out_idx = []
@@ -202,7 +217,12 @@ class LlamaBackbone:
                 b.logits[k - 1] = 1
                 out_idx.append(k - 1)
             b.n_tokens = n
-            rc = self.L.llama_decode(self.ctx, b)
+            try:
+                rc = self.L.llama_decode(self.ctx, b)
+            except OSError as e:
+                self.fault = BackboneFault(f"llama_decode crashed in native code ({e}); "
+                                           "the backbone is unusable until the process restarts")
+                raise self.fault from e
             if rc != 0:
                 raise RuntimeError(f"llama_decode failed ({rc})")
             out = np.empty((len(rows), self.H), np.float32)

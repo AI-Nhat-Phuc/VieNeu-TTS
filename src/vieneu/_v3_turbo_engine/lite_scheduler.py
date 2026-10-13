@@ -49,6 +49,11 @@ class FrameScheduler:
         self._cv = threading.Condition()
         threading.Thread(target=self._run, name="vieneu-frame-scheduler", daemon=True).start()
 
+    @property
+    def error(self) -> Optional[BaseException]:
+        """Why the scheduler can no longer serve (a crashed backbone), or None."""
+        return self.bb.fault
+
     # ── stream side ───────────────────────────────────────────────────────────
     def generate(self, prompt_embeds: np.ndarray, anchor, params, max_new_frames: int
                  ) -> Iterator[Tuple[List[int], bool]]:
@@ -57,6 +62,8 @@ class FrameScheduler:
         job = _Job(np.ascontiguousarray(prompt_embeds, np.float32), anchor, params, int(max_new_frames))
         if job.max_frames <= 0:
             return
+        if self.bb.fault is not None:
+            raise self.bb.fault
         with self._cv:
             self._pending.append(job)
             self._cv.notify()

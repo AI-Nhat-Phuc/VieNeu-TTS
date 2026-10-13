@@ -5,11 +5,15 @@ import json
 import struct
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from vieneu._v3_turbo_engine.llamacpp_backbone import StepBatcher, convert_backbone_gguf
+import ctypes as C
+
+from vieneu._v3_turbo_engine.llamacpp_backbone import (BackboneFault, LlamaBackbone, StepBatcher,
+                                                     convert_backbone_gguf)
 
 CFG = dict(num_hidden_layers=2, hidden_size=64, intermediate_size=128, num_attention_heads=4,
            num_key_value_heads=2, head_dim=16, max_position_embeddings=256, rope_theta=10000.0,
@@ -129,3 +133,36 @@ def test_step_batcher_propagates_decode_errors():
     with pytest.raises(RuntimeError, match="boom"):
         b.begin(np.zeros((2, 1), np.float32))
     assert len(b._free) == bb.n_seq_max           # the failed prefill gave its seq back
+
+
+def test_native_crash_in_decode_poisons_the_backbone():
+    """A C++ exception out of llama_decode (OSError 0xe06d7363 on Windows) leaves the
+    context half-updated: that call and every later one fail fast, and resetting a
+    sequence (the scheduler freeing a slot) stays a silent no-op."""
+    H = 4
+    calls = []
+
+    def crash(ctx, b):
+        calls.append("decode")
+        raise OSError("[WinError -529697949] Windows Error 0xe06d7363")
+
+    bb = object.__new__(LlamaBackbone)
+    bb.L = type("L", (), {"llama_decode": staticmethod(crash),
+                          "llama_memory_seq_rm": staticmethod(lambda *a: calls.append("rm"))})()
+    bb.ctx = bb.mem = None
+    bb.H, bb.n_seq_max, bb.n_batch = H, 2, 8
+    embd = (C.c_float * (8 * H))()
+    ints = [(C.c_int32 * 8)() for _ in range(2)]
+    seq_rows = [(C.c_int32 * 1)() for _ in range(8)]
+    seq = (C.POINTER(C.c_int32) * 8)(*[C.cast(r, C.POINTER(C.c_int32)) for r in seq_rows])
+    bb._batch = SimpleNamespace(embd=embd, pos=ints[0], n_seq_id=ints[1], seq_id=seq,
+                                logits=(C.c_int8 * 8)(), n_tokens=0)
+    bb._lock = threading.Lock()
+    bb.fault = None
+    rows = [(0, np.zeros((2, H), np.float32), 0)]
+    with pytest.raises(BackboneFault):
+        bb.decode(rows)
+    with pytest.raises(BackboneFault):
+        bb.decode(rows)
+    bb.reset(0)
+    assert calls == ["decode"]
