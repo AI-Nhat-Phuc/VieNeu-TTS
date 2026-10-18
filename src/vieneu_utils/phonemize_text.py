@@ -10,6 +10,8 @@ import re
 from typing import Optional
 from sea_g2p import SEAPipeline, G2P, Normalizer, punc_norm
 
+from vieneu_utils.vi_prosody import add_phrase_breaks, finalize_chunk, fix_spelling
+
 logger = logging.getLogger("Vieneu.Phonemizer")
 
 # Tách đoạn theo newline — dùng để normalize theo từng đoạn (ranh giới tự nhiên)
@@ -104,8 +106,13 @@ def _get_normalizer() -> PuncNormalizer:
 
 @functools.lru_cache(maxsize=1024)
 def _phonemize_cached(text: str, punc_norm: bool = True) -> str:
-    """Cached single-text phonemization (normalize + G2P), punc_norm bật mặc định."""
-    return _get_pipeline().run(text, punc_norm=punc_norm)
+    """Cached single-text phonemization (normalize + G2P), punc_norm bật mặc định.
+
+    punc_norm chỉ chốt dấu CUỐI (:func:`finalize_chunk`): punc_norm của sea-g2p
+    trên cả chuỗi gộp câu ngắn giữa chừng thành dấu phẩy, mất nhịp nghỉ.
+    """
+    ph = _get_pipeline().run(fix_spelling(text), punc_norm=False)
+    return finalize_chunk(ph) if punc_norm else ph
 
 
 def phonemize_text(text: str) -> str:
@@ -150,7 +157,7 @@ def phonemize_text_with_emotions(text: str) -> str:
         else:
             out += " " + ph
     # Chốt dấu cuối ở mức cả chunk (fragment bên trong đã punc_norm=False).
-    return punc_norm(out)
+    return finalize_chunk(out)
 
 
 def phonemize_batch(
@@ -176,14 +183,14 @@ def phonemize_batch(
 
     # punc_norm LUÔN bật ở tầng G2P: kể cả text đã normalize sẵn (skip_normalize)
     # hay thiếu dấu câu, chuỗi phones vẫn kết thúc bằng "." hợp lệ.
-    if skip_normalize:
-        # Texts are pre-normalized — only run the G2P layer
-        return g2p.phonemize_batch(texts, punc_norm=True, phoneme_dict=phoneme_dict)
-    else:
-        # Full pipeline: normalize (punc_norm) then G2P (punc_norm)
+    # punc_norm chỉ chốt dấu cuối (finalize_chunk), không gộp câu ngắn giữa chừng.
+    texts = [fix_spelling(t) for t in texts]
+    if not skip_normalize:
+        # Full pipeline: normalize then G2P
         normalizer = _get_normalizer()
-        normalized = [normalizer.normalize(t) for t in texts]
-        return g2p.phonemize_batch(normalized, punc_norm=True, phoneme_dict=phoneme_dict)
+        texts = [normalizer.normalize(t, punc_norm=False) for t in texts]
+    phones = g2p.phonemize_batch(texts, punc_norm=False, phoneme_dict=phoneme_dict)
+    return [finalize_chunk(p) for p in phones]
 
 
 def phonemize_with_dict(
@@ -203,15 +210,15 @@ def phonemize_with_dict(
             [text], skip_normalize=skip_normalize, phoneme_dict=phoneme_dict
         )[0]
     if skip_normalize:
-        # punc_norm vẫn bật ở tầng G2P dù text đã normalize sẵn.
-        return _get_g2p().phonemize_batch([text], punc_norm=True)[0]
+        # punc_norm vẫn chốt dấu cuối dù text đã normalize sẵn.
+        return phonemize_batch([text], skip_normalize=True)[0]
     return _phonemize_cached(text)
 
 
 def _normalize_sentence_keep_cues(sentence: str, normalizer) -> str:
     """Normalize MỘT câu, giữ nguyên inline emotion cue thành ``<|emotion_k|>``."""
     if "[" not in sentence and "<|emotion_" not in sentence:
-        return normalizer.normalize(sentence, punc_norm=False)
+        return add_phrase_breaks(normalizer.normalize(sentence, punc_norm=False))
     parts = []
     for i, part in enumerate(_EMOTION_SPLIT_RE.split(sentence)):
         if i % 2 == 1:                       # emotion tag
@@ -219,7 +226,7 @@ def _normalize_sentence_keep_cues(sentence: str, normalizer) -> str:
             parts.append(tok if tok is not None else part)
         elif part.strip():
             parts.append(normalizer.normalize(part, punc_norm=False))
-    return " ".join(p for p in parts if p)
+    return add_phrase_breaks(" ".join(p for p in parts if p))
 
 
 def _normalized_sentences_by_para(
@@ -245,6 +252,8 @@ def _normalized_sentences_by_para(
     paragraphs = [p for p in RE_NEWLINE_SPLIT.split(text) if p.strip()]
     if not paragraphs:
         return []
+    if not skip_normalize:
+        paragraphs = [fix_spelling(p) for p in paragraphs]
 
     normalizer = None if skip_normalize else _get_normalizer()
     out: list[list[str]] = []
@@ -257,7 +266,8 @@ def _normalized_sentences_by_para(
         elif keep_cues:
             out.append([_normalize_sentence_keep_cues(s, normalizer) for s in sentences])
         else:
-            out.append(normalizer.normalize_batch(sentences, punc_norm=False))
+            out.append([add_phrase_breaks(s) for s in
+                        normalizer.normalize_batch(sentences, punc_norm=False)])
     return out
 
 
@@ -283,7 +293,7 @@ def normalize_to_chunks(
     chunks: list[str] = []
     for sentences in _normalized_sentences_by_para(text, skip_normalize=skip_normalize):
         chunks.extend(pack_sentences_into_chunks(sentences, max_chars=max_chars))
-    return [punc_norm(c) for c in chunks]
+    return [finalize_chunk(c) for c in chunks]
 
 
 def normalize_to_chunks_v3(
@@ -385,7 +395,7 @@ def normalize_to_chunks_v3_with_gaps(
                 gaps.append("sentence")
             chunks.append(ch)
 
-    chunks = [punc_norm(c) for c in chunks]
+    chunks = [finalize_chunk(c) for c in chunks]
     gaps = [g if g == "para" else _classify_gap(chunks[i]) for i, g in enumerate(gaps)]
     # Gộp SAU punc_norm: từng mảnh đã chốt dấu câu cuối nên text gộp giữ nguyên
     # ngữ điệu ("Chương một. Nội dung..."); gap của các ranh giới còn lại không đổi.
@@ -422,8 +432,9 @@ def phonemize_to_chunks(
         normalized_units = [text]
     else:
         normalizer = _get_normalizer()
-        paragraphs = [p for p in RE_NEWLINE_SPLIT.split(text) if p.strip()] or [text]
-        normalized_units = normalizer.normalize_batch(paragraphs, punc_norm=True)
+        paragraphs = [fix_spelling(p) for p in RE_NEWLINE_SPLIT.split(text) if p.strip()] or [text]
+        normalized_units = [finalize_chunk(u) for u in
+                            normalizer.normalize_batch(paragraphs, punc_norm=False)]
 
     phonemes = phonemize_batch(
         normalized_units,
