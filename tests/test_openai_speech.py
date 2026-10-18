@@ -166,3 +166,8 @@ def test_activity_is_not_served_through_a_tunnel(client, monkeypatch):
     # cloudflared connects from loopback too; its headers give it away.
     assert client.get("/debug/activity", headers={"CF-Connecting-IP": "1.2.3.4"}).status_code == 404
     assert client.get("/debug/activity", headers={"X-Forwarded-For": "1.2.3.4"}).status_code == 404
+
+
+def test_health_reports_the_voice_revision(client):
+    from vieneu_utils.vi_prosody import VOICE_REVISION
+    assert client.get("/health").json()["voice_revision"] == VOICE_REVISION

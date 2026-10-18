@@ -85,6 +85,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
+from vieneu_utils.vi_prosody import VOICE_REVISION
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -583,7 +584,8 @@ def debug_activity(request: Request):
 def health():
     eng = engine()
     body = {"status": "ok", "backend": eng.backend, "max_streams": eng.max_streams,
-            "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE}
+            "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE,
+            "voice_revision": VOICE_REVISION}
     err = eng.stream_error()
     if err is not None:
         # 503 so a container healthcheck restarts us: the scheduler does not recover.
