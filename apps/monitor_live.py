@@ -103,6 +103,11 @@ def short_agent(agent: str) -> str:
     return agent.split("/")[0][:14] or "client"
 
 
+def caller(rec: dict) -> str:
+    """Who sent a request: the name it gave itself in ``X-VieNeu-Source``, else a guess from its User-Agent."""
+    return rec.get("source") or short_agent(rec.get("agent", ""))
+
+
 def initials(voice: str) -> str:
     words = [w for w in voice.replace("-", " ").split() if w]
     return ("".join(w[0] for w in words[:2]) or "♪").upper()
@@ -211,7 +216,7 @@ class LiveView:
     def _touch_client(self, rec, seen=None):
         ip = rec.get("client") or "?"
         c = self.clients.setdefault(ip, {"seen": 0.0})
-        c.update(agent=short_agent(rec.get("agent", "")), via=rec.get("via", ""), country=rec.get("country", ""))
+        c.update(agent=caller(rec)[:22], via=rec.get("via", ""), country=rec.get("country", ""))
         c["seen"] = max(c["seen"], seen or time.time())
 
     # particles ---------------------------------------------------------------
@@ -539,7 +544,7 @@ class LiveView:
         rrect(c, tx, y + 9, tx + cw, y + 25, 8, fill=mix(C["bg"], chip, 0.3 * fade), outline="")
         c.create_text(tx + cw / 2, y + 17, text=label, fill=mix(C["bg"], chip, fade), font=self.f_small)
         who = rec.get("client", "?") + (f" ({rec['country']})" if rec.get("country") else "")
-        head = (f"{rec.get('voice') or 'default voice'}   ·   {short_agent(rec.get('agent', ''))} {who}   ·   "
+        head = (f"{rec.get('voice') or 'default voice'}   ·   {caller(rec)} {who}   ·   "
                 f"{rec.get('format', '')} {rec.get('rate', 48000) // 1000} kHz   ·   {rec['id']}")
         c.create_text(tx + cw + 10, y + 17, anchor="w", text=head, fill=mix(C["bg"], C["fg"], fade),
                       font=self.f_small)
@@ -662,7 +667,7 @@ class LiveView:
             stats = (f"{rec.get('audio_s', 0):.1f} s audio   ttfa {rec['ttfa']} ms   "
                      f"rtf {(t_end - (rec.get('t_slot') or t_end)) / rec['audio_s']:.2f}"
                      if rec.get("audio_s") and rec.get("ttfa") is not None else (rec.get("error") or rec.get("state")))
-            stats += f"   {short_agent(rec.get('agent', ''))} {rec.get('client', '')}"
+            stats += f"   {caller(rec)} {rec.get('client', '')}"
             sx = W - 120 - self.f_small.measure(stats) - 14
             text = " ".join(rec.get("text", "").split())
             tx0, tw = x + 190, sx - (x + 190) - 16

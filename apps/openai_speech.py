@@ -207,6 +207,13 @@ class _Slot:
             self._eng.release()
 
 
+def _source(value: Optional[str]) -> str:
+    """The caller's own name for why it sent this request (``X-VieNeu-Source``, e.g.
+    ``story-services/drain``), so the monitor can tell a cron job from a listener.
+    Free text from the client: kept short and printable."""
+    return "".join(ch for ch in (value or "") if ch.isprintable())[:40].strip()
+
+
 class Activity:
     """What the server is doing right now, for ``GET /debug/activity`` (the desktop
     monitor draws it): every request from queued to done, which normalized text
@@ -229,7 +236,8 @@ class Activity:
                "rate": req.sample_rate,
                "client": h.get("cf-connecting-ip") or (request.client.host if request is not None and request.client else "?"),
                "via": "cloudflare" if "cf-ray" in h else "direct", "country": h.get("cf-ipcountry") or "",
-               "agent": (h.get("user-agent") or "")[:80], "t_start": time.time(), "t_slot": None,
+               "agent": (h.get("user-agent") or "")[:80], "source": _source(h.get("x-vieneu-source")),
+               "t_start": time.time(), "t_slot": None,
                "ttfa": None, "audio_s": 0.0, "segments": [], "segment": -1,
                "env": collections.deque(maxlen=self.ENV_TAIL), "env_n": 0, "_carry": np.zeros(0, np.float32),
                "t_end": None, "error": None}

@@ -161,6 +161,17 @@ def test_activity_follows_a_request_from_start_to_done(client, eng, monkeypatch)
     assert done["audio_s"] == pytest.approx(0.1) and done["ttfa"] is not None and len(done["env"]) == 64
 
 
+def test_activity_records_the_callers_own_source(client, eng, monkeypatch):
+    monkeypatch.setattr(api, "LOOPBACK", ("testclient",))
+    r = client.post("/v1/audio/speech", json={"input": "Xin chào."},
+                    headers={"X-VieNeu-Source": "story-services/drain" + "x" * 60})
+    assert r.status_code == 200
+    assert _speech(client).status_code == 200
+    recent = client.get("/debug/activity").json()["recent"]
+    assert recent[0]["source"] == ""                     # no header: nothing to show
+    assert recent[1]["source"] == ("story-services/drain" + "x" * 60)[:40]   # unprintable dropped, capped
+
+
 def test_activity_is_not_served_through_a_tunnel(client, monkeypatch):
     monkeypatch.setattr(api, "LOOPBACK", ("testclient",))
     # cloudflared connects from loopback too; its headers give it away.
