@@ -184,6 +184,59 @@ def test_health_reports_the_voice_revision(client):
     assert client.get("/health").json()["voice_revision"] == VOICE_REVISION
 
 
+@pytest.fixture
+def exits(monkeypatch):
+    """Records the scheduled process exit instead of running it."""
+    seen = []
+
+    class Timer:
+        def __init__(self, delay, fn, args=()):
+            seen.append((fn, args))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(api.threading, "Timer", Timer)
+    return seen
+
+
+def test_backbone_crash_returns_503_and_restarts_the_process(client, eng, exits):
+    lite_bb = SimpleNamespace(fault=None)
+    eng._lite_runner = SimpleNamespace(bb=lite_bb)
+
+    def crash(text, **kw):
+        lite_bb.fault = RuntimeError("llama_decode crashed in native code")
+        raise lite_bb.fault
+        yield
+
+    eng.tts.infer_stream = crash
+    r = _speech(client)
+    assert r.status_code == 503                # not an empty 200
+    assert client.get("/health").status_code == 503
+    assert exits == [(api.os._exit, (70,))]    # once, however many requests saw it
+    assert _speech(client).status_code == 503
+    assert len(exits) == 1
+    assert eng.active == 0
+
+
+def test_exit_on_fault_can_be_disabled(client, eng, exits, monkeypatch):
+    monkeypatch.setenv("VIENEU_EXIT_ON_FAULT", "0")
+    eng.sched = SimpleNamespace(error=RuntimeError("worker died"))
+    eng.exit_if_broken()
+    assert exits == []
+
+
+def test_failure_before_any_audio_is_a_500(client, eng, exits):
+    def bad(text, **kw):
+        raise ValueError("bad voice file")
+        yield
+
+    eng.tts.infer_stream = bad
+    r = _speech(client)
+    assert r.status_code == 500 and "ValueError" in r.json()["error"]["message"]
+    assert exits == [] and eng.active == 0
+
+
 def test_keep_warm_speaks_only_when_no_stream_runs(eng):
     calls = len(eng.tts.stream_calls)
     eng.acquire()                               # a listener is being served
