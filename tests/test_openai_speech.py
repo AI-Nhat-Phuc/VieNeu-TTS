@@ -182,3 +182,30 @@ def test_activity_is_not_served_through_a_tunnel(client, monkeypatch):
 def test_health_reports_the_voice_revision(client):
     from vieneu_utils.vi_prosody import VOICE_REVISION
     assert client.get("/health").json()["voice_revision"] == VOICE_REVISION
+
+
+def test_keep_warm_speaks_only_when_no_stream_runs(eng):
+    calls = len(eng.tts.stream_calls)
+    eng.acquire()                               # a listener is being served
+    assert eng.keep_warm() is False
+    assert len(eng.tts.stream_calls) == calls
+    eng.release()
+    before = eng.last_used
+    assert eng.keep_warm() is True
+    assert len(eng.tts.stream_calls) == calls + 1
+    assert eng.last_used >= before
+    assert eng.active == 0                      # not counted as a request
+    assert eng._gate.acquire(blocking=False)    # and its slot was given back
+    eng._gate.release()
+
+
+def test_keep_warm_and_pin_are_off_by_default(eng, monkeypatch):
+    for var in ("VIENEU_KEEP_WARM_SECONDS", "VIENEU_PIN_MB"):
+        monkeypatch.delenv(var, raising=False)
+    started = []
+    monkeypatch.setattr(api.threading, "Thread", lambda **kw: started.append(kw) or SimpleNamespace(start=lambda: None))
+    api._startup()
+    assert started == []
+    monkeypatch.setenv("VIENEU_KEEP_WARM_SECONDS", "180")
+    api._startup()
+    assert [kw["name"] for kw in started] == ["keep-warm"]
