@@ -33,6 +33,9 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras,
                      range-checked (out of range → 400): 0-2 / 1-1024 / (0, 1] / 1-2 / 64-512
 
+A request with ``X-VieNeu-No-Wait: 1`` is not queued: with no free stream slot it
+gets 429 at once (story-services asks for the next sentence ahead this way).
+
 POST /v1/voices refuses (409) the name of a built-in voice or alias, so a client
 cannot swap out a voice other clients rely on (e.g. the default one).
 
@@ -55,6 +58,10 @@ Environment:
                         VIENEU_ACOUSTIC_THREADS=0 (0 = cores/4, max 4)
     VIENEU_API_KEY=...  (Bearer auth; unset = open — logged as a warning when
                         HOST is not a loopback address)
+    VIENEU_KEEP_WARM_SECONDS=0  after this many idle seconds, speak a short line
+                        (in no caller's slot) so the OS does not page the model out;
+                        0 = off. VIENEU_PIN_MB=0  Windows: keep this many MB of the
+                        process resident (hard minimum working set); 0 = off
     VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
                                        (HOST=0.0.0.0 to serve other machines; the
                                        Docker profiles set it)
@@ -153,18 +160,21 @@ class Engine:
         self.waiting = 0
         # Warm-up: capture the CUDA graphs / load the ONNX graphs before the
         # first client pays for it.
-        for _ in self.tts.infer_stream("Xin chào.", apply_watermark=False):
-            pass
+        self.speak_short()
+        self.last_used = time.monotonic()
         log.info("✅ ready in %.1fs: backend=%s max_streams=%d queue=%d", time.perf_counter() - t,
                  self.backend, self.max_streams, self.max_queue)
 
-    def acquire(self) -> None:
+    def acquire(self, wait: bool = True) -> None:
+        """Take a stream slot, queuing up to `queue_timeout` s; 429 when none comes.
+        `wait=False` (header ``X-VieNeu-No-Wait: 1``) answers 429 at once instead:
+        for a caller asking ahead, who would rather ask again later than queue."""
         with self._lock:
             if self.waiting >= self.max_queue:
                 raise HTTPException(429, "server busy: queue full", headers={"Retry-After": "1"})
             self.waiting += 1
         try:
-            if not self._gate.acquire(timeout=self.queue_timeout):
+            if not (self._gate.acquire(timeout=self.queue_timeout) if wait else self._gate.acquire(blocking=False)):
                 raise HTTPException(429, "server busy: timed out waiting for a stream slot",
                                     headers={"Retry-After": "2"})
         finally:
@@ -176,7 +186,28 @@ class Engine:
     def release(self) -> None:
         with self._lock:
             self.active -= 1
+            self.last_used = time.monotonic()
         self._gate.release()
+
+    def speak_short(self) -> None:
+        for _ in self.tts.infer_stream("Xin chào.", apply_watermark=False):
+            pass
+
+    def keep_warm(self) -> bool:
+        """Speak a short line when no stream runs, so every weight is touched again.
+
+        On a machine short of RAM the OS pages an idle model out: the first request
+        after ~15 idle minutes waited 6 s for its first byte instead of 0.25 s. Takes
+        a slot only if one is free right now, and is not counted as a request."""
+        if self.active or not self._gate.acquire(blocking=False):
+            return False
+        try:
+            self.speak_short()
+        finally:
+            self._gate.release()
+        with self._lock:
+            self.last_used = time.monotonic()
+        return True
 
     def stream_error(self) -> Optional[BaseException]:
         """Why the GPU stream scheduler (or the llama.cpp backbone) died, or None.
@@ -317,6 +348,42 @@ def engine() -> Engine:
     return ENGINE
 
 
+def _pin_working_set(mb: int) -> None:
+    """Windows: keep at least `mb` MB of this process resident.
+
+    A hard minimum working set: the memory manager trims other processes before
+    it pages these out. Pages count once touched, so the warm-up and the
+    keep-warm line bring the model in. Needs no admin rights (every user holds
+    SeIncreaseWorkingSetPrivilege)."""
+    if mb <= 0 or os.name != "nt":
+        return
+    import ctypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.SetProcessWorkingSetSizeEx.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                                               ctypes.c_uint32]
+    hard_min, soft_max = 0x1, 0x8  # QUOTA_LIMITS_HARDWS_MIN_ENABLE | ..._MAX_DISABLE
+    lo = mb << 20
+    if k32.SetProcessWorkingSetSizeEx(k32.GetCurrentProcess(), lo, lo + (512 << 20), hard_min | soft_max):
+        log.info("📌 keeping %d MB of the model resident", mb)
+    else:
+        log.warning("could not pin %d MB resident (error %d)", mb, ctypes.get_last_error())
+
+
+def _keep_warm_loop(eng: Engine, idle_s: float) -> None:
+    while True:
+        time.sleep(max(5.0, idle_s / 4))
+        if time.monotonic() - eng.last_used < idle_s:
+            continue
+        try:
+            t = time.perf_counter()
+            if eng.keep_warm():
+                log.info("keep-warm: %.2fs", time.perf_counter() - t)
+        except Exception:  # never take the server down over a warm-up line
+            log.exception("keep-warm failed")
+
+
 # ── auth / errors in OpenAI's shape ───────────────────────────────────────────
 
 def _auth(authorization: Optional[str] = Header(default=None)) -> None:
@@ -351,7 +418,11 @@ async def _invalid_request(_req: Request, exc: RequestValidationError):
 
 @app.on_event("startup")
 def _startup() -> None:
-    engine()
+    eng = engine()
+    _pin_working_set(_env_int("VIENEU_PIN_MB", 0))
+    idle_s = _env_int("VIENEU_KEEP_WARM_SECONDS", 0)
+    if idle_s > 0:
+        threading.Thread(target=_keep_warm_loop, args=(eng, idle_s), name="keep-warm", daemon=True).start()
 
 
 # ── audio helpers ────────────────────────────────────────────────────────────
@@ -493,7 +564,8 @@ def speech(req: SpeechRequest, request: Request = None):
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     rec = ACTIVITY.start(rid, req, request)
     try:
-        eng.acquire()   # 429 if the server is full; released when the stream ends
+        # 429 if the server is full; released when the stream ends
+        eng.acquire(wait=(request.headers.get("x-vieneu-no-wait") != "1") if request is not None else True)
     except HTTPException:
         ACTIVITY.finish(rid, "rejected", "server busy (429)")
         raise

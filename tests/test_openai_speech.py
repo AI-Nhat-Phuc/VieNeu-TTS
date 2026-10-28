@@ -219,3 +219,44 @@ def test_failure_before_any_audio_is_a_500(client, eng, exits):
     r = _speech(client)
     assert r.status_code == 500 and "ValueError" in r.json()["error"]["message"]
     assert exits == [] and eng.active == 0
+
+
+def test_keep_warm_speaks_only_when_no_stream_runs(eng):
+    calls = len(eng.tts.stream_calls)
+    eng.acquire()                               # a listener is being served
+    assert eng.keep_warm() is False
+    assert len(eng.tts.stream_calls) == calls
+    eng.release()
+    before = eng.last_used
+    assert eng.keep_warm() is True
+    assert len(eng.tts.stream_calls) == calls + 1
+    assert eng.last_used >= before
+    assert eng.active == 0                      # not counted as a request
+    assert eng._gate.acquire(blocking=False)    # and its slot was given back
+    eng._gate.release()
+
+
+def test_keep_warm_and_pin_are_off_by_default(eng, monkeypatch):
+    for var in ("VIENEU_KEEP_WARM_SECONDS", "VIENEU_PIN_MB"):
+        monkeypatch.delenv(var, raising=False)
+    started = []
+    monkeypatch.setattr(api.threading, "Thread", lambda **kw: started.append(kw) or SimpleNamespace(start=lambda: None))
+    api._startup()
+    assert started == []
+    monkeypatch.setenv("VIENEU_KEEP_WARM_SECONDS", "180")
+    api._startup()
+    assert [kw["name"] for kw in started] == ["keep-warm"]
+
+
+def test_no_wait_request_is_refused_at_once_when_every_slot_is_taken(client, eng):
+    import time as _time
+
+    for _ in range(eng.max_streams):
+        eng.acquire()                           # every slot is taken
+    t = _time.monotonic()
+    r = client.post("/v1/audio/speech", json={"input": "Xin chào."}, headers={"X-VieNeu-No-Wait": "1"})
+    assert r.status_code == 429
+    assert _time.monotonic() - t < 1            # not the 10 s queue
+    for _ in range(eng.max_streams):
+        eng.release()
+    assert _speech(client).status_code == 200   # a normal request still gets a slot
