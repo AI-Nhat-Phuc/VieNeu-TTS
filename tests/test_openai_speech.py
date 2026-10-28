@@ -246,3 +246,17 @@ def test_keep_warm_and_pin_are_off_by_default(eng, monkeypatch):
     monkeypatch.setenv("VIENEU_KEEP_WARM_SECONDS", "180")
     api._startup()
     assert [kw["name"] for kw in started] == ["keep-warm"]
+
+
+def test_no_wait_request_is_refused_at_once_when_every_slot_is_taken(client, eng):
+    import time as _time
+
+    for _ in range(eng.max_streams):
+        eng.acquire()                           # every slot is taken
+    t = _time.monotonic()
+    r = client.post("/v1/audio/speech", json={"input": "Xin chào."}, headers={"X-VieNeu-No-Wait": "1"})
+    assert r.status_code == 429
+    assert _time.monotonic() - t < 1            # not the 10 s queue
+    for _ in range(eng.max_streams):
+        eng.release()
+    assert _speech(client).status_code == 200   # a normal request still gets a slot

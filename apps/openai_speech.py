@@ -33,6 +33,9 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras,
                      range-checked (out of range → 400): 0-2 / 1-1024 / (0, 1] / 1-2 / 64-512
 
+A request with ``X-VieNeu-No-Wait: 1`` is not queued: with no free stream slot it
+gets 429 at once (story-services asks for the next sentence ahead this way).
+
 POST /v1/voices refuses (409) the name of a built-in voice or alias, so a client
 cannot swap out a voice other clients rely on (e.g. the default one).
 
@@ -162,13 +165,16 @@ class Engine:
         log.info("✅ ready in %.1fs: backend=%s max_streams=%d queue=%d", time.perf_counter() - t,
                  self.backend, self.max_streams, self.max_queue)
 
-    def acquire(self) -> None:
+    def acquire(self, wait: bool = True) -> None:
+        """Take a stream slot, queuing up to `queue_timeout` s; 429 when none comes.
+        `wait=False` (header ``X-VieNeu-No-Wait: 1``) answers 429 at once instead:
+        for a caller asking ahead, who would rather ask again later than queue."""
         with self._lock:
             if self.waiting >= self.max_queue:
                 raise HTTPException(429, "server busy: queue full", headers={"Retry-After": "1"})
             self.waiting += 1
         try:
-            if not self._gate.acquire(timeout=self.queue_timeout):
+            if not (self._gate.acquire(timeout=self.queue_timeout) if wait else self._gate.acquire(blocking=False)):
                 raise HTTPException(429, "server busy: timed out waiting for a stream slot",
                                     headers={"Retry-After": "2"})
         finally:
@@ -558,7 +564,8 @@ def speech(req: SpeechRequest, request: Request = None):
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     rec = ACTIVITY.start(rid, req, request)
     try:
-        eng.acquire()   # 429 if the server is full; released when the stream ends
+        # 429 if the server is full; released when the stream ends
+        eng.acquire(wait=(request.headers.get("x-vieneu-no-wait") != "1") if request is not None else True)
     except HTTPException:
         ACTIVITY.finish(rid, "rejected", "server busy (429)")
         raise
