@@ -20,6 +20,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import numpy as np
 
 from .base import BaseVieneuTTS
+from .run_ahead import run_ahead
 from ._v3_turbo_engine.rep_history import DEFAULT_REP_WINDOW
 from vieneu_utils.phonemize_text import (
     phonemize_text_with_emotions,
@@ -664,6 +665,10 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
 
         ``on_segment(i, chunks)``, if given, is called as text chunk ``i`` of the
         normalized ``chunks`` starts producing audio (a server shows progress with it).
+
+        ``lender`` (see ``vieneu/run_ahead.py``), if given, lends this call stream
+        slots nobody uses: on CPU/ONNX the next text chunks are generated while
+        the current one plays, so one long input uses the idle streams too.
         """
         on_segment = kwargs.get("on_segment")
         speaker_emb, ref_codes = self._resolve_ref(voice, ref_audio, denoise, use_ref_codes)
@@ -679,7 +684,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                                                 use_ref_codes, max_new_frames, sampling)
         else:
             per_chunk = self._stream_chunks_engine(chunks, speaker_emb, ref_codes,
-                                                   use_ref_codes, max_new_frames, sampling)
+                                                   use_ref_codes, max_new_frames, sampling,
+                                                   lender=kwargs.get("lender"))
         sr = self.sample_rate
         last_out: Optional[np.ndarray] = None   # mẩu audio cuối đã phát của chunk trước
         for ci, subs in enumerate(per_chunk):
@@ -701,18 +707,24 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 yield self._apply_watermark(sub) if apply_watermark else sub
 
     def _stream_chunks_engine(self, chunks, speaker_emb, ref_codes, use_ref_codes,
-                              max_new_frames, sampling):
+                              max_new_frames, sampling, lender=None):
         """One audio iterator per text chunk from the engine's own streaming
-        (PyTorch single path or ONNX); a full ``infer`` per chunk if it has none."""
+        (PyTorch single path or ONNX); a full ``infer`` per chunk if it has none.
+        With a ``lender`` later chunks run ahead on its spare slots."""
         stream_fn = getattr(self.engine, "infer_stream", None)
-        for chunk in chunks:
-            ph = phonemize_text_with_emotions(chunk)
-            gen_kwargs = dict(
-                phonemes=ph, speaker_emb=speaker_emb, ref_codes=ref_codes,
-                use_ref_codes=use_ref_codes,
-                max_new_frames=min(max_new_frames, max_expected_frames(ph)), **sampling,
-            )
-            yield stream_fn(**gen_kwargs) if stream_fn is not None else (self.engine.infer(**gen_kwargs),)
+
+        def maker(chunk):
+            def make():
+                ph = phonemize_text_with_emotions(chunk)
+                gen_kwargs = dict(
+                    phonemes=ph, speaker_emb=speaker_emb, ref_codes=ref_codes,
+                    use_ref_codes=use_ref_codes,
+                    max_new_frames=min(max_new_frames, max_expected_frames(ph)), **sampling,
+                )
+                return stream_fn(**gen_kwargs) if stream_fn is not None else (self.engine.infer(**gen_kwargs),)
+            return make
+
+        return run_ahead([maker(c) for c in chunks], lender)
 
     def _stream_chunks_gpu(self, sched, chunks, speaker_emb, ref_codes, use_ref_codes,
                            max_new_frames, sampling):

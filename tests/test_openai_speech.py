@@ -276,3 +276,23 @@ def test_no_wait_request_is_refused_at_once_when_every_slot_is_taken(client, eng
     for _ in range(eng.max_streams):
         eng.release()
     assert _speech(client).status_code == 200   # a normal request still gets a slot
+
+
+def test_lending_keeps_one_slot_free_and_stops_for_a_waiter(monkeypatch, eng):
+    monkeypatch.setattr(eng, "max_streams", 4)
+    monkeypatch.setattr(eng, "run_ahead", 3)
+    monkeypatch.setattr(eng, "_gate", api.threading.BoundedSemaphore(4))
+    eng.acquire()                                  # the request's own slot
+    lender = api._Lender(eng)
+    assert lender.borrow() and lender.borrow()
+    assert not lender.borrow()                     # the last free slot stays for the next request
+    assert eng.lent == 2 and api.health()["lent"] == 2
+    lender.give_back()
+    eng.waiting = 1                                # someone is queued: lend nothing, ask back
+    assert lender.wanted() and not lender.borrow()
+    eng.waiting = 0
+    lender.give_back()
+    eng.release()
+    assert eng.lent == 0 and eng.active == 0
+    for _ in range(4):
+        assert eng._gate.acquire(blocking=False)   # every slot came back

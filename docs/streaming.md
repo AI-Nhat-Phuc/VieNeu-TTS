@@ -64,6 +64,7 @@ Environment:
 | `VIENEU_MAX_STREAMS` | GPU 16 · CPU 1 (int8: 2) | Streams served at once. On GPU this is the continuous-batch size — **match it to your real load** (see below) |
 | `VIENEU_QUEUE` | = `MAX_STREAMS` | Requests allowed to wait for a slot; beyond that → immediate `429` |
 | `VIENEU_QUEUE_TIMEOUT` | 10 | Max seconds in the queue; then `429` |
+| `VIENEU_RUN_AHEAD` | `MAX_STREAMS`−1 | CPU / llama.cpp: spare slots one request may borrow to generate its next text chunks while the current one plays (`0` = one chunk after another). One slot always stays free, and a queued request takes a lent slot back at once |
 | `VIENEU_API_KEY` | (empty) | If set, requires `Authorization: Bearer <key>`. Unset on a non-loopback `HOST` → a warning at start-up |
 | `VIENEU_WATERMARK` | 1 | Perth audio watermark, per chunk |
 | `HOST` / `PORT` | `127.0.0.1` / 8000 | `HOST=0.0.0.0` to serve other machines (the Docker profiles set it) — together with `VIENEU_API_KEY` |

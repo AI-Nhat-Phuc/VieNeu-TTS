@@ -44,11 +44,16 @@ batching, default 16); CPU serves one (fp32) or two (int8) — the ONNX engine
 interleaves them frame by frame but they share the cores.
 Extra requests wait up to ``VIENEU_QUEUE_TIMEOUT`` s in a queue of at most
 ``VIENEU_QUEUE`` entries, then get 429 with Retry-After.
+Run ahead (CPU / llama.cpp): a long input is spoken chunk by chunk; while one
+plays, its next chunks are generated on stream slots nobody uses, up to
+``VIENEU_RUN_AHEAD`` extra (default MAX_STREAMS-1, 0 = off). One slot stays free
+for the next request, and a queued request takes a lent slot back at once.
 
 Environment:
     VIENEU_BACKEND=auto|onnx|pytorch   VIENEU_DEVICE=auto|cuda|cpu
     VIENEU_PRECISION=fp32|int8 (CPU)   VIENEU_ONNX_DIR=... (local ONNX export)
     VIENEU_MAX_STREAMS=16 (GPU)        VIENEU_QUEUE=16   VIENEU_QUEUE_TIMEOUT=10
+    VIENEU_RUN_AHEAD=MAX_STREAMS-1 (spare slots one request may borrow; 0 = off)
     VIENEU_THREADS=0 (ONNX intra-op threads; 0 = engine default)
     VIENEU_LLAMACPP_LIB=<llama.cpp release dir>  backbone on llama.cpp — Vulkan on
                         any GPU (AMD/Intel/NVIDIA) or ggml CPU, streams batched;
@@ -155,10 +160,15 @@ class Engine:
             self.max_streams = _env_int("VIENEU_MAX_STREAMS", cpu_default) if "VIENEU_MAX_STREAMS" in os.environ else cpu_default
         self.max_queue = _env_int("VIENEU_QUEUE", self.max_streams)
         self.queue_timeout = float(os.environ.get("VIENEU_QUEUE_TIMEOUT", "10"))
+        # Run ahead: a request may speak its next text chunks on slots nobody
+        # uses, up to this many at once (0 = one chunk after another). One slot
+        # always stays free for the next request, and none is lent while one waits.
+        self.run_ahead = max(0, _env_int("VIENEU_RUN_AHEAD", self.max_streams - 1))
         self._gate = threading.BoundedSemaphore(self.max_streams)
         self._lock = threading.Lock()
         self.active = 0
         self.waiting = 0
+        self.lent = 0
         # Warm-up: capture the CUDA graphs / load the ONNX graphs before the
         # first client pays for it.
         self.speak_short()
@@ -188,6 +198,22 @@ class Engine:
         with self._lock:
             self.active -= 1
             self.last_used = time.monotonic()
+        self._gate.release()
+
+    def lend(self) -> bool:
+        """A spare slot for run-ahead, or False: never the last free one, never
+        while a request waits for a slot."""
+        with self._lock:
+            if self.waiting or self.max_streams - self.active - self.lent < 2:
+                return False
+            if not self._gate.acquire(blocking=False):
+                return False
+            self.lent += 1
+            return True
+
+    def give_back(self) -> None:
+        with self._lock:
+            self.lent -= 1
         self._gate.release()
 
     def speak_short(self) -> None:
@@ -240,6 +266,30 @@ class Engine:
                         "gender": v.get("gender", ""), "featured": v.get("featured"),
                         "aliases": list(v.get("aliases") or [])})
         return out
+
+
+class _Lender:
+    """What one request may borrow from the ``Engine`` (``vieneu/run_ahead.py``)."""
+
+    def __init__(self, eng: Engine):
+        self._eng = eng
+        self._lock = threading.Lock()
+        self.held = 0
+
+    def borrow(self) -> bool:
+        with self._lock:
+            if self.held >= self._eng.run_ahead or not self._eng.lend():
+                return False
+            self.held += 1
+            return True
+
+    def give_back(self) -> None:
+        with self._lock:
+            self.held -= 1
+        self._eng.give_back()
+
+    def wanted(self) -> bool:
+        return self._eng.waiting > 0
 
 
 class _Slot:
@@ -504,6 +554,7 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
             temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
             repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
             on_segment=(lambda i, chunks: ACTIVITY.segment(rec, i, chunks)) if rec else None,
+            lender=_Lender(eng) if eng.run_ahead else None,
         ):
             if chunk is None or len(chunk) == 0:
                 continue
@@ -696,7 +747,7 @@ def debug_activity(request: Request):
 def health():
     eng = engine()
     body = {"status": "ok", "backend": eng.backend, "max_streams": eng.max_streams,
-            "active": eng.active, "waiting": eng.waiting, "sample_rate": SAMPLE_RATE,
+            "active": eng.active, "waiting": eng.waiting, "lent": eng.lent, "sample_rate": SAMPLE_RATE,
             "voice_revision": VOICE_REVISION}
     err = eng.stream_error()
     if err is not None:
