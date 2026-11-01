@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import collections
 import ctypes
+import http.client
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 from ctypes import wintypes
 from tkinter import ttk
@@ -205,6 +207,41 @@ def http_json(url: str, timeout: float = 4.0, headers: dict | None = None):
         return None, None, str(getattr(e, "code", "") or e)[:80]
 
 
+class KeepAliveJSON:
+    """GET JSON over one kept-open connection, like a real client that reuses it.
+
+    A fresh urlopen per poll paid DNS + TCP + TLS to the Cloudflare edge every
+    time (0.4-1.5 s from a busy desktop), so the card showed the handshake, not
+    the tunnel: over a reused connection /health comes back in ~0.1 s."""
+
+    def __init__(self, base: str):
+        u = urllib.parse.urlsplit(base)
+        self._cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        self._host, self._prefix = u.netloc, u.path.rstrip("/")
+        self._conn = None
+
+    def __call__(self, path: str, timeout: float = 4.0):
+        t = time.perf_counter()
+        for attempt in (0, 1):            # a connection the edge closed while idle: open a new one once
+            try:
+                if self._conn is None:
+                    self._conn = self._cls(self._host, timeout=timeout)
+                self._conn.timeout = timeout
+                self._conn.request("GET", self._prefix + path, headers={"User-Agent": "vieneu-monitor"})
+                r = self._conn.getresponse()
+                body = r.read()
+                if r.status >= 400:
+                    return None, None, str(r.status)
+                return json.loads(body.decode()), (time.perf_counter() - t) * 1000, None
+            except Exception as e:  # unreachable, tunnel down ...
+                if self._conn is not None:
+                    self._conn.close()
+                self._conn = None
+                if attempt:
+                    return None, None, str(e)[:80]
+                t = time.perf_counter()
+
+
 def api_key(explicit: str | None = None) -> str:
     """The server's key: --api-key, else VIENEU_API_KEY, else the repo's .env (what serve_public.ps1 reads)."""
     if explicit or os.environ.get("VIENEU_API_KEY"):
@@ -306,6 +343,7 @@ class Monitor(tk.Tk):
         self.state = {}
         self.activity, self.activity_err, self._activity_seen = None, None, None
         self._public_seen = None
+        self._public_get = KeepAliveJSON(self.args.public_url)
         self._key = api_key(args.api_key)
         self._style()
         self._build()
@@ -439,7 +477,7 @@ class Monitor(tk.Tk):
             st = {}
             st["local"], st["local_ms"], st["local_err"] = http_json(self.args.local_url + "/health", 3)
             if n % 3 == 0 or "public" not in self.state:
-                st["public"], st["public_ms"], st["public_err"] = http_json(self.args.public_url + "/health", 8)
+                st["public"], st["public_ms"], st["public_err"] = self._public_get("/health", 8)
                 st["public_t"] = time.time()
             else:
                 st.update({k: self.state.get(k) for k in ("public", "public_ms", "public_err", "public_t")})
