@@ -296,3 +296,151 @@ def test_lending_keeps_one_slot_free_and_stops_for_a_waiter(monkeypatch, eng):
     assert eng.lent == 0 and eng.active == 0
     for _ in range(4):
         assert eng._gate.acquire(blocking=False)   # every slot came back
+
+
+# ── merging identical requests ───────────────────────────────────────────────
+
+def _req(headers=None):
+    from starlette.requests import Request
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "headers": raw, "client": ("testclient", 1)})
+
+
+def _body(resp) -> bytes:
+    import asyncio
+
+    async def read():
+        return b"".join([c async for c in resp.body_iterator])
+    return asyncio.run(read())
+
+
+@pytest.fixture
+def noisy(eng):
+    """infer_stream yields three random chunks: two separate takes never match."""
+    def stream(text, **kw):
+        eng.tts.stream_calls.append(kw)
+        for _ in range(3):
+            yield np.random.uniform(-0.5, 0.5, 4800).astype(np.float32)
+    eng.tts.infer_stream = stream
+    eng.tts.stream_calls.clear()
+    return eng
+
+
+def test_same_speech_at_the_same_time_is_generated_once(noisy):
+    a = api.speech(api.SpeechRequest(input="Xin chào.", voice="Mai Anh"), _req())
+    b = api.speech(api.SpeechRequest(input="Xin chào.", voice="Mai Anh"), _req())
+    assert noisy.active == 1                       # B took no slot of its own
+    assert b.headers["X-VieNeu-Merged-Into"] == a.headers["X-Request-Id"]
+    body_a, body_b = _body(a), _body(b)
+    assert body_a == body_b and len(body_a) == 44 + 3 * 4800 * 2
+    assert len(noisy.tts.stream_calls) == 1
+    gc.collect()
+    assert noisy.active == 0 and api.MERGES.live == {}
+
+
+def test_alias_merges_with_its_voice(noisy):
+    a = api.speech(api.SpeechRequest(input="Xin chào.", voice="Hải Đăng"), _req())
+    b = api.speech(api.SpeechRequest(input="Xin chào.", voice="Minh Quân"), _req())
+    assert "X-VieNeu-Merged-Into" in b.headers
+    assert _body(a) == _body(b)
+
+
+@pytest.mark.parametrize("other", [{"input": "Tạm biệt."}, {"temperature": 0.5}, {"sample_rate": 24000}])
+def test_different_speech_is_not_merged(noisy, other):
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    with pytest.raises(api.HTTPException) as e:    # the single CPU slot is A's
+        api.speech(api.SpeechRequest(**{"input": "Xin chào.", **other}), _req({"X-VieNeu-No-Wait": "1"}))
+    assert e.value.status_code == 429
+    _body(a)
+
+
+def test_no_merge_header_asks_for_a_fresh_take(noisy):
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    with pytest.raises(api.HTTPException):
+        api.speech(api.SpeechRequest(input="Xin chào."),
+                   _req({"X-VieNeu-No-Wait": "1", "X-VieNeu-No-Merge": "1"}))
+    _body(a)
+
+
+def test_merged_request_keeps_its_audio_when_the_first_caller_leaves(noisy):
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    b = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    del a
+    gc.collect()
+    assert noisy.active == 1                       # still generating for B
+    assert len(_body(b)) == 44 + 3 * 4800 * 2
+    gc.collect()
+    assert noisy.active == 0
+
+
+def test_generation_stops_when_every_caller_leaves(noisy):
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    b = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    del a, b
+    gc.collect()
+    assert noisy.active == 0 and api.MERGES.live == {}
+    assert noisy._gate.acquire(blocking=False)
+    noisy._gate.release()
+
+
+def test_late_request_past_the_window_generates_its_own(noisy, monkeypatch):
+    monkeypatch.setenv("VIENEU_MERGE_WINDOW", "0.05")   # less than one chunk
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    with pytest.raises(api.HTTPException):         # not merged: queues for the slot A holds
+        api.speech(api.SpeechRequest(input="Xin chào."), _req({"X-VieNeu-No-Wait": "1"}))
+    _body(a)
+
+
+def test_merged_request_is_shown_on_the_monitor(noisy, monkeypatch):
+    a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    b = api.speech(api.SpeechRequest(input="Xin chào."), _req())
+    live = {r["id"]: r for r in api.ACTIVITY.snapshot()["live"]}
+    rb = live[b.headers["X-Request-Id"]]
+    assert rb["state"] == "merged" and rb["merged"] == a.headers["X-Request-Id"]
+    _body(a), _body(b)
+    done = api.ACTIVITY.snapshot()["recent"]
+    assert {r["state"] for r in done[:2]} == {"done"}
+    assert all(r["audio_s"] == pytest.approx(0.3) for r in done[:2])
+
+
+def _in_threads(*calls):
+    import threading
+    out = [None] * len(calls)
+
+    def run(i, fn):
+        try:
+            out[i] = fn()
+        except Exception as e:  # noqa: BLE001
+            out[i] = e
+    ts = [threading.Thread(target=run, args=(i, fn)) for i, fn in enumerate(calls)]
+    for t in ts:
+        t.start()
+        t.join(0.2)                               # the first is queued before the second comes
+    return ts, out
+
+
+def test_identical_requests_queued_together_share_one_slot(noisy):
+    noisy.acquire()                               # the single CPU slot is busy
+    ask = lambda: api.speech(api.SpeechRequest(input="Xin chào."), _req())   # noqa: E731
+    ts, out = _in_threads(ask, ask)
+    assert noisy.waiting == 1                     # only the first queues for a slot
+    noisy.release()
+    for t in ts:
+        t.join(5)
+    a, b = out
+    assert _body(a) == _body(b) and len(noisy.tts.stream_calls) == 1
+    gc.collect()
+    assert noisy.active == 0
+
+
+def test_merged_request_shares_the_429_of_the_one_it_waited_with(noisy, monkeypatch):
+    monkeypatch.setattr(noisy, "queue_timeout", 0.5)
+    noisy.acquire()
+    ask = lambda: api.speech(api.SpeechRequest(input="Xin chào."), _req())   # noqa: E731
+    ts, out = _in_threads(ask, ask)
+    for t in ts:
+        t.join(5)
+    noisy.release()
+    assert all(isinstance(e, api.HTTPException) and e.status_code == 429 for e in out)
+    states = [r["state"] for r in api.ACTIVITY.snapshot()["recent"][:2]]
+    assert states == ["rejected", "rejected"] and api.MERGES.live == {}

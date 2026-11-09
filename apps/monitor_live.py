@@ -22,7 +22,7 @@ import tkinter.font as tkfont
 PALETTE = ["#58a6ff", "#f778ba", "#3fb950", "#f0883e", "#bc8cff", "#39c5cf", "#e3b341", "#ff7b72"]
 PHONEMES = "aəɛeiɨoɔuŋɲʔʂʐχɣθðʃ"
 STATE_STYLE = {"queued": ("QUEUED", "#d29922"), "prefill": ("THINKING", "#bc8cff"),
-               "streaming": ("SPEAKING", "#3fb950")}
+               "streaming": ("SPEAKING", "#3fb950"), "merged": ("MERGED", "#39c5cf")}
 END_STYLE = {"done": "#3fb950", "cancelled": "#d29922", "error": "#f85149", "rejected": "#f85149"}
 CHARS_PER_AUDIO_S = 14.0            # rough Vietnamese reading speed, for the reading cursor
 TEXT_SPEED, AUDIO_SPEED = 300.0, 340.0   # particle speeds, px/s

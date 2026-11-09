@@ -48,6 +48,12 @@ Run ahead (CPU / llama.cpp): a long input is spoken chunk by chunk; while one
 plays, its next chunks are generated on stream slots nobody uses, up to
 ``VIENEU_RUN_AHEAD`` extra (default MAX_STREAMS-1, 0 = off). One slot stays free
 for the next request, and a queued request takes a lent slot back at once.
+Merging: a request for exactly the same speech (input, voice, sampling extras,
+sample_rate) as one still running — or still queued — reads that one's audio
+instead of generating its own: no slot of its own, and both callers get the
+same audio (header ``X-VieNeu-Merged-Into: <request id>``). It can join while
+the audio so far is under ``VIENEU_MERGE_WINDOW`` s (default 30). Off with
+``VIENEU_MERGE=0``, or per request with ``X-VieNeu-No-Merge: 1`` (a fresh take).
 
 Environment:
     VIENEU_BACKEND=auto|onnx|pytorch   VIENEU_DEVICE=auto|cuda|cpu
@@ -354,6 +360,8 @@ class Activity:
             rec["segment"] = i
 
     def audio(self, rec: dict, chunk: np.ndarray) -> None:
+        if "_carry" not in rec:          # already finished
+            return
         x = np.concatenate([rec["_carry"], np.asarray(chunk, np.float32)])
         n = len(x) // self.ENV_WIN
         rms = np.sqrt(np.mean(x[:n * self.ENV_WIN].reshape(n, self.ENV_WIN) ** 2, axis=1)) if n else ()
@@ -586,6 +594,179 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
                  f"{total/audio_s:.2f}" if audio_s else "-", eng.active)
 
 
+def _leader_source(eng: Engine, req: SpeechRequest, rid: str, rec: dict, wait: bool) -> Iterator[np.ndarray]:
+    """Take a stream slot (429 if none comes), then speak ``req``. Lazy: the slot
+    is taken on the first pull, so a request merged into this one while it is
+    still queued waits with it instead of queuing for a slot of its own."""
+    try:
+        eng.acquire(wait=wait)
+    except HTTPException:
+        ACTIVITY.finish(rid, "rejected", "server busy (429)")
+        raise
+    ACTIVITY.set(rec, state="prefill", t_slot=time.time())
+    yield from _speech_chunks(eng, req, rid, _Slot(eng), rec)
+
+
+class _Broadcast:
+    """One generation, read by every request that asked for exactly the same
+    speech while it runs. Whichever reader needs the next chunk first pulls it
+    from the source (one at a time); the others read it from the buffer. The
+    source is closed — its stream slot freed — when the last reader leaves.
+
+    New readers may join while the audio so far is under ``window`` samples;
+    after that the buffer keeps only what some reader has yet to send."""
+
+    def __init__(self, source: Iterator[np.ndarray], key: tuple, rid: str, merges: "_Merges", window: int):
+        self.source, self.key, self.rid = source, key, rid
+        self._merges, self._window = merges, window
+        self._lock = threading.Lock()        # buffer and readers
+        self._pull = threading.Lock()        # one reader at a time runs the source
+        self._chunks: list = []
+        self._base = 0                       # index of _chunks[0] in the whole stream
+        self._samples = 0
+        self._done, self._err = False, None
+        self._pos: dict = {}                 # reader id -> index of its next chunk
+        self._ids = itertools.count()
+        self.joinable, self.closed = True, False
+
+    def subscribe(self) -> Optional[Iterator[np.ndarray]]:
+        with self._lock:
+            if not self.joinable or self.closed:
+                return None
+            sid = next(self._ids)
+            self._pos[sid] = self._base
+        it = self._read(sid)
+        # A reader that is never iterated never runs its finally.
+        weakref.finalize(it, self._leave, sid)
+        return it
+
+    def readers(self) -> int:
+        with self._lock:
+            return len(self._pos)
+
+    def _read(self, sid: int) -> Iterator[np.ndarray]:
+        try:
+            while True:
+                with self._lock:
+                    i = self._pos[sid]
+                    if i - self._base < len(self._chunks):
+                        chunk = self._chunks[i - self._base]
+                        self._pos[sid] = i + 1
+                        if not self.joinable:
+                            self._trim()
+                    elif self._done:
+                        if self._err is not None:
+                            raise self._err
+                        return
+                    else:
+                        chunk = None
+                if chunk is not None:
+                    yield chunk
+                    continue
+                with self._pull:
+                    with self._lock:
+                        if self._done or self._pos[sid] - self._base < len(self._chunks):
+                            continue         # another reader pulled it meanwhile
+                    err = None
+                    try:
+                        chunk = next(self.source)
+                    except StopIteration:
+                        pass
+                    except Exception as e:  # noqa: BLE001 - every reader re-raises it
+                        err = e
+                    with self._lock:
+                        if chunk is None:
+                            self._done, self._err, self.joinable = True, err, False
+                        else:
+                            self._chunks.append(chunk)
+                            self._samples += len(chunk)
+                            if self._samples > self._window:
+                                self.joinable = False
+                    if chunk is None:
+                        self._merges.drop(self)
+        finally:
+            self._leave(sid)
+
+    def _trim(self) -> None:
+        low = min(self._pos.values())
+        if low > self._base:
+            del self._chunks[:low - self._base]
+            self._base = low
+
+    def _leave(self, sid: int) -> None:
+        with self._lock:
+            if self._pos.pop(sid, None) is None:
+                return
+            if self._pos:
+                return
+            self.closed = True
+            abandon = not self._done
+        self._merges.drop(self)
+        if abandon:
+            with self._pull:
+                self.source.close()          # the stream's finally frees its slot
+            ACTIVITY.finish(self.rid, "cancelled")   # no-op unless it never started
+
+
+class _Merges:
+    """Generations running now, by what they speak. A request for exactly the
+    same speech (text, voice, sampling, rate) as one already running reads that
+    one's audio instead of generating its own: no second slot, no second wait
+    in the queue, and the same audio for both callers."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.live: dict = {}
+
+    def join_or_lead(self, key: tuple, make_source, rid: str, window: int):
+        """(rid of the request that generates, reader iterator)."""
+        with self._lock:
+            b = self.live.get(key)
+            it = b.subscribe() if b is not None else None
+            if it is not None:
+                return b.rid, it
+            b = _Broadcast(make_source(), key, rid, self, window)
+            self.live[key] = b
+            return rid, b.subscribe()
+
+    def drop(self, b: _Broadcast) -> None:
+        with self._lock:
+            if self.live.get(b.key) is b:
+                del self.live[b.key]
+
+
+MERGES = _Merges()
+
+
+def _merge_key(eng: Engine, req: SpeechRequest) -> tuple:
+    voice = eng.tts.resolve_voice_name(req.voice) if req.voice else None
+    return (req.input, voice, req.temperature, req.top_k, req.top_p, req.repetition_penalty,
+            req.max_chars, req.sample_rate)
+
+
+def _merged_chunks(it: Iterator[np.ndarray], rid: str, rec: dict, rate: int) -> Iterator[np.ndarray]:
+    """A merged request's audio, read from the one it joined; recorded for the
+    monitor, which keeps it in state "merged" (it holds no stream slot)."""
+    t0, n = time.perf_counter(), 0
+    state, error = "cancelled", None
+    try:
+        for c in it:
+            if n == 0:
+                ACTIVITY.set(rec, ttfa=round((time.perf_counter() - t0) * 1000))
+            n += len(c)
+            yield c
+        state = "done"
+    except HTTPException:
+        state, error = "rejected", "server busy (429)"
+        raise
+    except Exception as e:  # noqa: BLE001 - recorded for the monitor, then re-raised
+        state, error = "error", repr(e)[:200]
+        raise
+    finally:
+        ACTIVITY.set(rec, audio_s=n / rate)
+        ACTIVITY.finish(rid, state, error)
+
+
 def _audio_body(chunks: Iterator[np.ndarray], fmt: str, rate: int) -> Iterator[bytes]:
     if fmt == "wav":
         yield _wav_header(rate)
@@ -623,30 +804,41 @@ def speech(req: SpeechRequest, request: Request = None):
         raise HTTPException(503, "speech engine is down; it is restarting (see /health)")
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     rec = ACTIVITY.start(rid, req, request)
-    try:
-        # 429 if the server is full; released when the stream ends
-        eng.acquire(wait=(request.headers.get("x-vieneu-no-wait") != "1") if request is not None else True)
-    except HTTPException:
-        ACTIVITY.finish(rid, "rejected", "server busy (429)")
-        raise
-    ACTIVITY.set(rec, state="prefill", t_slot=time.time())
-    slot = _Slot(eng)
-    chunks = _speech_chunks(eng, req, rid, slot, rec)
-    # A generator that never starts never runs its finally: if the client is gone
-    # before the body is read, the slot is freed when the body is dropped.
-    weakref.finalize(chunks, slot.release)
-    weakref.finalize(chunks, ACTIVITY.finish, rid, "cancelled")   # no-op once the stream finished
+    h = request.headers if request is not None else {}
+    # 429 if the server is full (taken on the first pull); released when the stream ends
+    wait = h.get("x-vieneu-no-wait") != "1"
+    leader = rid
+    if os.environ.get("VIENEU_MERGE", "1") != "0" and h.get("x-vieneu-no-merge") != "1":
+        window = int(float(os.environ.get("VIENEU_MERGE_WINDOW", "30")) * req.sample_rate)
+        leader, it = MERGES.join_or_lead(_merge_key(eng, req),
+                                         lambda: _leader_source(eng, req, rid, rec, wait), rid, window)
+        if leader == rid:
+            # Its record follows the generation, which outlives this caller when
+            # others merged into it: closed by the stream, or by _Broadcast._leave.
+            chunks = it
+        else:
+            log.info("%s merged into %s (same speech)", rid, leader)
+            ACTIVITY.set(rec, state="merged", merged=leader)
+            chunks = _merged_chunks(it, rid, rec, req.sample_rate)
+            weakref.finalize(chunks, ACTIVITY.finish, rid, "cancelled")   # no-op once it finished
+    else:
+        chunks = _leader_source(eng, req, rid, rec, wait)
+        weakref.finalize(chunks, ACTIVITY.finish, rid, "cancelled")   # no-op once the stream finished
     # Wait for the first audio before sending headers: a request that fails
-    # before producing any (a crashed backbone, a bad voice file) gets a real
-    # error status instead of an empty 200.
+    # before producing any (a crashed backbone, a bad voice file, a full server)
+    # gets a real error status instead of an empty 200.
     try:
         head = next(chunks, None)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001 - logged by the engine; mapped to a status here
         if eng.stream_error() is not None:
             raise HTTPException(503, "speech engine is down; it is restarting") from e
         raise HTTPException(500, f"speech generation failed: {type(e).__name__}") from e
     body = chunks if head is None else itertools.chain((head,), chunks)
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
+    if leader != rid:
+        headers["X-VieNeu-Merged-Into"] = leader
     ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
