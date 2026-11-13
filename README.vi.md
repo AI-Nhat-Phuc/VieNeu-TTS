@@ -85,7 +85,7 @@
 
 1. [🦜 Cài đặt & Giao diện Web](#installation)
 2. [📦 Sử dụng Python SDK](#sdk)
-3. [🐳 API Server & Docker](#docker-remote) — API streaming chuẩn OpenAI (v3 Turbo) · server v2 cũ
+3. [🐳 API Server & Docker](#docker-remote) — API streaming chuẩn OpenAI (v3 Turbo) · endpoint dùng sẵn `tts.falevon.com` · server v2 cũ
 4. [📊 Benchmark](#benchmarks) — mọi số đo tốc độ / độ trễ ở một chỗ (CPU vs GPU, batch, streaming, Nano)
 5. [🎓 Fine-tune (LoRA)](#finetune)
 6. [🔬 Tổng quan mô hình](#backbones)
@@ -383,6 +383,41 @@ with client.audio.speech.with_streaming_response.create(
 ```
 
 Endpoint: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v1/voices` (nhân bản giọng từ clip upload), `GET /health`. Số luồng giới hạn theo backend (`VIENEU_MAX_STREAMS`, mặc định 16 trên GPU / 1 trên CPU), có hàng đợi nhỏ, quá thì `429`.
+
+#### Endpoint dùng sẵn — `https://tts.falevon.com`
+
+API này đang chạy công khai tại **`https://tts.falevon.com`** (v3 Turbo, backbone llama.cpp, **6 luồng đồng thời**, đứng sau Cloudflare Tunnel). [Falevon](https://www.falevon.com) dùng nó để đọc truyện; bạn gọi y như server chạy ở máy, với base URL `https://tts.falevon.com/v1`.
+
+- **API key**: mọi lệnh gọi `/v1/*` cần header `Authorization: Bearer <key>`; thiếu hoặc sai key sẽ nhận `401 invalid api key`. Xin key từ người quản lý và chỉ để key ở phía server — đừng nhúng vào trang web hay app di động. `GET /health` không cần key.
+- **Âm thanh**: `pcm` (s16le mono, không header) hoặc `wav`; mặc định 48 kHz, hoặc đặt `sample_rate` 24000 / 16000 / 8000. Không hỗ trợ mp3 / opus / aac / flac (`400`). `speed` và `instructions` được nhận nhưng bỏ qua.
+- **Giọng**: mọi giọng trong [Các giọng dựng sẵn](#các-giọng-dựng-sẵn) (`GET /v1/voices` liệt kê đủ); không truyền `voice` thì dùng **Hải Đăng**. Giọng thêm bằng `POST /v1/voices` chỉ nằm trong bộ nhớ, mất khi server khởi động lại.
+- **Khi bận**: quá 6 luồng thì request chờ tối đa 10 s trong hàng đợi ngắn, rồi nhận `429` kèm `Retry-After`. Gửi header `X-VieNeu-No-Wait: 1` để nhận `429` ngay thay vì chờ (ví dụ khi đọc trước câu kế tiếp). `503` nghĩa là engine đang khởi động lại; thử lại sau vài giây.
+
+```bash
+export VIENEU_API_KEY=...   # key của bạn
+
+curl -s https://tts.falevon.com/health      # {"status":"ok","backend":"onnx","max_streams":6,"active":0,...}
+
+curl -sS https://tts.falevon.com/v1/audio/speech \
+  -H "Authorization: Bearer $VIENEU_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"vieneu-v3-turbo","voice":"Mai Anh","input":"Xin chào từ tts.falevon.com!","response_format":"wav"}' \
+  -o hello.wav
+
+# Client đo TTFA / RTF ở trên, trỏ vào server dùng sẵn
+uv run python examples/openai_speech_client.py --base https://tts.falevon.com --api-key "$VIENEU_API_KEY" --voice "Mai Anh"
+```
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="https://tts.falevon.com/v1", api_key=os.environ["VIENEU_API_KEY"])
+with client.audio.speech.with_streaming_response.create(
+    model="vieneu-v3-turbo", voice="Mai Anh", input="Xin chào từ tts.falevon.com!",
+    response_format="wav",
+) as r:
+    r.stream_to_file("hello.wav")      # hoặc r.iter_bytes(4096) để phát ngay khi đang tải
+```
 
 📊 **[docs/streaming.vi.md](docs/streaming.vi.md)** — toàn bộ số đo trên RTX 3060 (TTFA / RTF / số luồng theo `max_streams`), dự đoán cho GPU nhỏ hơn, số đo CPU, và các lưu ý tinh chỉnh (ví dụ request đầu tiên sau khi GPU rỗi chậm thêm 100–300 ms vì GPU hạ xung).
 

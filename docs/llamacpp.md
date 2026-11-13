@@ -182,7 +182,7 @@ It also has buttons to restart the server or the tunnel, and to start or stop
 everything.
 
 ```bash
-.venv\Scripts\pythonw.exe -m apps.monitor_desktop --logs <log dir> --public-url https://tts.example.com --task VieNeu-TTS
+.venv\Scripts\pythonw.exe -m apps.monitor_desktop --logs <log dir> --public-url https://tts.falevon.com --task VieNeu-TTS
 ```
 
 It expects a watchdog that runs `serve_public.ps1` and `cloudflared tunnel run`,
