@@ -88,6 +88,12 @@ Environment:
                         (in no caller's slot) so the OS does not page the model out;
                         0 = off. VIENEU_PIN_MB=0  Windows: keep this many MB of the
                         process resident (hard minimum working set); 0 = off
+    VIENEU_PROSODY=native|dsp  how speed/pitch/effort are made (see `speed` above)
+    VIENEU_PREWARM="effort=1;effort=2;speed=1.2;speed=0.85;pitch=2;pitch=-2"  settings
+                        whose voice variants are built in the background while
+                        idle, for VIENEU_PREWARM_VOICES=a,b (default: every voice);
+                        0 = off. They are kept in VIENEU_VARIANT_DIR
+                        (~/.cache/vieneu/variants; 0 = memory only) across restarts
     VIENEU_WATERMARK=1                 HOST=127.0.0.1  PORT=8000
                                        (HOST=0.0.0.0 to serve other machines; the
                                        Docker profiles set it)
@@ -470,6 +476,51 @@ def _keep_warm_loop(eng: Engine, idle_s: float) -> None:
             log.exception("keep-warm failed")
 
 
+DEFAULT_PREWARM = "effort=1;effort=2;speed=1.2;speed=0.85;pitch=2;pitch=-2"
+
+
+def _prewarm_jobs(eng: Engine) -> list:
+    """(voice, plan) pairs to build ahead: every setting in ``VIENEU_PREWARM``
+    (``;``-separated tag bodies, ``0`` = off) for every voice in
+    ``VIENEU_PREWARM_VOICES`` (``,``-separated; default: all built-in voices)."""
+    spec = os.environ.get("VIENEU_PREWARM", DEFAULT_PREWARM).strip()
+    if spec in ("", "0") or not hasattr(eng.tts, "voice_variant"):
+        return []
+    names = [v.strip() for v in os.environ.get("VIENEU_PREWARM_VOICES", "").split(",") if v.strip()]
+    if not names:
+        names = list(getattr(eng.tts, "_preset_voices", {}))
+    plans = []
+    for body in (b.strip() for b in spec.split(";")):
+        if not body:
+            continue
+        try:
+            (part,) = split_prosody(f"[{body}] x")
+        except (ProsodyError, ValueError):
+            log.warning("prewarm: skipping bad setting %r", body)
+            continue
+        plan = plan_for(part.prosody, True)
+        if plan.reshapes_reference and plan not in plans:
+            plans.append(plan)
+    return [(v, p) for v in names if eng.tts.resolve_voice_name(v) for p in plans]
+
+
+def _prewarm_loop(eng: Engine, jobs: list, poll_s: float = 1.0) -> None:
+    """Build the voice variants of ``jobs`` one by one, only while no request
+    is streaming or waiting, so a listener never shares the CPU with it. A
+    variant already on disk loads in milliseconds."""
+    t0, built = time.perf_counter(), 0
+    for voice, plan in jobs:
+        while eng.active or eng.waiting:
+            time.sleep(poll_s)
+        try:
+            t = time.perf_counter()
+            eng.tts.voice_variant(voice, plan)
+            built += (time.perf_counter() - t) > 0.2          # a real build, not a disk hit
+        except Exception:  # never take the server down over a warm-up
+            log.exception("prewarm %r failed", voice)
+    log.info("prewarm: %d voice variants ready (%d built) in %.0fs", len(jobs), built, time.perf_counter() - t0)
+
+
 # ── auth / errors in OpenAI's shape ───────────────────────────────────────────
 
 def _auth(authorization: Optional[str] = Header(default=None)) -> None:
@@ -509,6 +560,9 @@ def _startup() -> None:
     idle_s = _env_int("VIENEU_KEEP_WARM_SECONDS", 0)
     if idle_s > 0:
         threading.Thread(target=_keep_warm_loop, args=(eng, idle_s), name="keep-warm", daemon=True).start()
+    jobs = _prewarm_jobs(eng)
+    if jobs:
+        threading.Thread(target=_prewarm_loop, args=(eng, jobs), name="prewarm", daemon=True).start()
 
 
 # ── audio helpers ────────────────────────────────────────────────────────────

@@ -453,7 +453,7 @@ with client.audio.speech.with_streaming_response.create(
     r.stream_to_file("happy.wav")
 ```
 
-- The **first** request for a voice at a new setting builds the variant, so its first audio comes 2–7 s later (measured on tts.falevon.com, CPU); later ones reuse it and start in ~0.3–0.5 s as usual. Settings are rounded (speed 0.05, pitch 0.5 semitone), so there are few variants.
+- **Common settings are built ahead** for every voice — `effort` 1 and 2, `speed` 1.2 and 0.85, `pitch` +2 and −2 — in the background while the server is idle, and kept on disk so a restart does not rebuild them; with those the first audio comes at once (~0.3–0.5 s). Any other setting makes its first request 2–7 s slower (building the variant), later ones are normal. Settings are rounded (speed 0.05, pitch 0.5 semitone), so there are few variants. Self-hosting: change the list with `VIENEU_PREWARM` / `VIENEU_PREWARM_VOICES`.
 - An out-of-range value or an unknown voice in a tag → `400`, before any audio.
 - **Other emotions** (happy, sad, whispering…): `instructions` is still ignored. The most convincing way is to clone a voice from a clip spoken in that mood (`POST /v1/voices`) and switch to it with `[voice=…]`.
 - Details and measurements: [docs/streaming.md](docs/streaming.md).
