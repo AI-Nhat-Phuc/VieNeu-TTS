@@ -86,7 +86,11 @@ Body JSON — các trường của OpenAI cộng vài trường mở rộng:
 | `response_format` | `wav` | `pcm` (s16le mono, không header) · `wav` (header độ dài "không xác định", player phát ngay). `mp3/opus/aac/flac` → `400` |
 | `stream_format` | `audio` | `audio`: body là bytes theo chunked transfer · `sse`: Server-Sent Events (bên dưới) |
 | `sample_rate` | 48000 | 48000 (gốc) · 24000 (chuẩn `pcm` của OpenAI) · 16000 · 8000 — resample từng chunk bằng soxr, không thêm trễ |
-| `speed`, `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết) |
+| `speed` | 1.0 | 0.25–4 (đẹp nhất 0.7–1.5). Co giãn thời gian trên audio đang stream, giữ nguyên cao độ |
+| `pitch` | 0 | Bán cung, −12…12. Trường thêm (OpenAI không có) |
+| `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết). Tông giọng/cảm xúc đến từ giọng tham chiếu: clone một giọng từ mẫu nói với cảm xúc đó |
+
+Tag trong `input` đổi tốc độ, cao độ hoặc giọng từ chỗ đó trở đi: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` Các tín hiệu `[cười]` `[thở dài]` `[hắng giọng]` vẫn dùng được. Giá trị sai hoặc giọng không có trong tag → 400.
 | `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,8 / 25 / 0,95 / 1,2 | Sampling; cho phép 0–2 / 1–1024 / (0, 1] / 1–2, ngoài khoảng (hoặc NaN) → `400` |
 | `max_chars` | 256 | Độ dài chunk văn bản tối đa, 64–512 |
 

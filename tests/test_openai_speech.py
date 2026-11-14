@@ -19,6 +19,7 @@ class FakeTTS:
         self._preset_voices = {"Hải Đăng": {}, "Mai Anh": {}}
         self._voice_aliases = {"Minh Quân": "Hải Đăng"}
         self.stream_calls = []
+        self.texts = []
         self.enrolled = []
 
     def resolve_voice_name(self, name):
@@ -29,7 +30,11 @@ class FakeTTS:
 
     def infer_stream(self, text, **kw):
         self.stream_calls.append(kw)
+        self.texts.append(text)
         yield np.zeros(4800, dtype=np.float32)
+
+    def _apply_watermark(self, wav):
+        return wav
 
     def add_voice(self, name, path, **kw):
         self.enrolled.append(name)
@@ -444,3 +449,56 @@ def test_merged_request_shares_the_429_of_the_one_it_waited_with(noisy, monkeypa
     assert all(isinstance(e, api.HTTPException) and e.status_code == 429 for e in out)
     states = [r["state"] for r in api.ACTIVITY.snapshot()["recent"][:2]]
     assert states == ["rejected", "rejected"] and api.MERGES.live == {}
+
+
+# ── speed / pitch / inline tags ──────────────────────────────────────────────
+
+def _fresh(eng):
+    """Forget the startup warm-up call, so a test sees only its own."""
+    eng.tts.stream_calls.clear()
+    eng.tts.texts.clear()
+
+
+def _samples(r):
+    assert r.status_code == 200, r.text
+    return len(r.content) // 2          # pcm s16le
+
+
+def test_speed_shortens_the_audio_and_is_no_longer_ignored(client, eng):
+    plain = _samples(_speech(client, response_format="pcm"))
+    r = _speech(client, response_format="pcm", speed=2.0)
+    assert _samples(r) == plain // 2
+    assert "X-VieNeu-Ignored" not in r.headers
+
+
+def test_pitch_keeps_the_length(client, eng):
+    plain = _samples(_speech(client, response_format="pcm"))
+    assert _samples(_speech(client, response_format="pcm", pitch=-4)) == plain
+
+
+def test_plain_request_is_one_untouched_call(client, eng):
+    _fresh(eng)
+    _speech(client, input="Xin chào [cười] bạn.")
+    assert eng.tts.texts == ["Xin chào [cười] bạn."]
+    assert eng.tts.stream_calls[0]["apply_watermark"] == eng.watermark
+
+
+def test_inline_tags_split_the_input_by_voice_and_speed(client, eng):
+    _fresh(eng)
+    r = _speech(client, response_format="pcm",
+                input="Một. [speed=2 voice=Mai Anh] Hai. [reset] Ba.")
+    assert [t.strip() for t in eng.tts.texts] == ["Một.", "Hai.", "Ba."]
+    assert [c["voice"] for c in eng.tts.stream_calls] == [None, "Mai Anh", None]
+    assert _samples(r) == 4800 + 2400 + 4800
+
+
+@pytest.mark.parametrize("body", [{"speed": 5}, {"pitch": 13}, {"input": "a [speed=0.1] b"},
+                                  {"input": "a [pitch=x] b"}, {"input": "a [voice=Nobody] b"}])
+def test_bad_prosody_is_rejected_up_front(client, eng, body):
+    _fresh(eng)
+    assert _speech(client, **body).status_code in (400, 422)
+    assert eng.tts.stream_calls == []
+
+
+def test_instructions_are_still_reported_as_ignored(client, eng):
+    assert _speech(client, instructions="vui vẻ").headers["X-VieNeu-Ignored"] == "instructions"

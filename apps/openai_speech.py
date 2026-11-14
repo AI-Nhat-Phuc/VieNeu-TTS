@@ -27,7 +27,16 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     stream_format    "audio" (default: raw chunked body) | "sse" (Server-Sent
                      Events: {"type":"speech.audio.delta","audio":"<base64>"} ...
                      {"type":"speech.audio.done","usage":{...}})
-    speed            accepted for compatibility, ignored (header X-VieNeu-Ignored)
+    speed            0.25-4 (OpenAI's range; cleanest 0.7-1.5), time-stretch, pitch kept
+    pitch            extra: semitones, -12..12 (0 = the voice as is)
+                     Both can change mid-text with inline tags, from the tag on:
+                     "[speed=1.3]", "[pitch=-2 speed=0.9]", "[voice=Mai Anh]",
+                     "[reset]" (back to the request's values). Non-verbal cues
+                     "[cười]" "[thở dài]" "[hắng giọng]" are spoken as before.
+                     See src/vieneu_utils/prosody.py.
+    instructions     accepted for compatibility, ignored (header X-VieNeu-Ignored):
+                     tone/emotion come from the voice — clone one from a sample
+                     spoken in that mood (POST /v1/voices) and switch with [voice=…]
     sample_rate      48000 (native) | 24000 (OpenAI's pcm rate) | 16000 | 8000 —
                      resampled on the fly (soxr), per chunk, no extra latency
     temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras,
@@ -105,6 +114,7 @@ from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
 from vieneu_utils.vi_prosody import VOICE_REVISION
+from vieneu_utils.prosody import Part, Prosody, ProsodyError, Shifter, split_prosody
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -355,7 +365,7 @@ class Activity:
 
     def segment(self, rec: dict, i: int, chunks: list) -> None:
         with self._lock:
-            if not rec["segments"]:
+            if len(chunks) > len(rec["segments"]):   # later parts of a tagged input add theirs
                 rec["segments"] = [c[:400] for c in chunks[:64]]
             rec["segment"] = i
 
@@ -536,7 +546,8 @@ class SpeechRequest(BaseModel):
     voice: Optional[str] = None
     response_format: str = "wav"
     stream_format: str = "audio"
-    speed: Optional[float] = None
+    speed: Optional[float] = Field(None, ge=0.25, le=4.0, allow_inf_nan=False)
+    pitch: float = Field(0.0, ge=-12.0, le=12.0, allow_inf_nan=False)   # semitones
     instructions: Optional[str] = None
     sample_rate: int = SAMPLE_RATE
     # Bounded so one request cannot break the GPU scheduler every stream shares:
@@ -548,6 +559,49 @@ class SpeechRequest(BaseModel):
     max_chars: int = Field(256, ge=64, le=512)
 
 
+def _prosody_parts(req: SpeechRequest):
+    """The input cut at its prosody tags (raises ProsodyError on a bad value)."""
+    base = Prosody(req.speed or 1.0, req.pitch, req.voice or None)
+    return split_prosody(req.input, base) or [Part(req.input, base)]
+
+
+def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iterator[np.ndarray]:
+    """48 kHz chunks for ``req``: each part of the input spoken in its own voice,
+    at its own speed and pitch. Plain text with neither set is one untouched call."""
+    parts = _prosody_parts(req)
+    seen: list = []                                  # text chunks of earlier parts, for the monitor
+    for part in parts:
+        p = part.prosody
+        shift = Shifter(p.speed, p.pitch, SAMPLE_RATE)
+        mine: list = []                              # this part's text chunks
+
+        def on_seg(i, chunks, base=len(seen), mine=mine):
+            mine[:] = chunks
+            ACTIVITY.segment(rec, base + i, seen + list(chunks))
+        gen = eng.tts.infer_stream(
+            part.text, voice=p.voice, apply_watermark=eng.watermark and shift.identity,
+            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
+            repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
+            on_segment=on_seg if rec else None,
+            lender=_Lender(eng) if eng.run_ahead else None,
+        )
+        try:
+            if shift.identity:
+                yield from gen
+            else:
+                end = object()
+                for chunk in itertools.chain(gen, (end,)):
+                    last = chunk is end
+                    if not last and (chunk is None or len(chunk) == 0):
+                        continue
+                    y = shift(np.zeros(0, np.float32) if last else chunk, last=last)
+                    if len(y):
+                        yield eng.tts._apply_watermark(y) if eng.watermark else y
+        finally:
+            gen.close()        # a caller that left frees the engine's stream now, not at GC
+        seen.extend(mine)
+
+
 def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
                    rec: Optional[dict] = None) -> Iterator[np.ndarray]:
     """float32 chunks at ``req.sample_rate``; logs TTFA / RTF; holds one stream slot."""
@@ -557,13 +611,7 @@ def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,
     rs = _Resampler(req.sample_rate)
     state, error = "cancelled", None             # unless the loop runs to the end
     try:
-        for chunk in eng.tts.infer_stream(
-            req.input, voice=req.voice or None, apply_watermark=eng.watermark,
-            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
-            repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
-            on_segment=(lambda i, chunks: ACTIVITY.segment(rec, i, chunks)) if rec else None,
-            lender=_Lender(eng) if eng.run_ahead else None,
-        ):
+        for chunk in _shaped_stream(eng, req, rec):
             if chunk is None or len(chunk) == 0:
                 continue
             if first is None:
@@ -741,7 +789,7 @@ MERGES = _Merges()
 def _merge_key(eng: Engine, req: SpeechRequest) -> tuple:
     voice = eng.tts.resolve_voice_name(req.voice) if req.voice else None
     return (req.input, voice, req.temperature, req.top_k, req.top_p, req.repetition_penalty,
-            req.max_chars, req.sample_rate)
+            req.max_chars, req.sample_rate, req.speed or 1.0, req.pitch)
 
 
 def _merged_chunks(it: Iterator[np.ndarray], rid: str, rec: dict, rate: int) -> Iterator[np.ndarray]:
@@ -799,6 +847,14 @@ def speech(req: SpeechRequest, request: Request = None):
         raise HTTPException(400, f"sample_rate must be one of {RATES}")
     if req.voice and eng.tts.resolve_voice_name(req.voice) is None:
         raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
+    try:
+        parts = _prosody_parts(req)
+    except ProsodyError as e:
+        raise HTTPException(400, str(e)) from None
+    for part in parts:
+        v = part.prosody.voice
+        if v and eng.tts.resolve_voice_name(v) is None:
+            raise HTTPException(400, f"unknown voice '{v}' in [voice=…]; see GET /v1/voices")
     if eng.stream_error() is not None:
         # Say so now: once the 200 headers are out, a failure only truncates the body.
         raise HTTPException(503, "speech engine is down; it is restarting (see /health)")
@@ -839,7 +895,7 @@ def speech(req: SpeechRequest, request: Request = None):
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
     if leader != rid:
         headers["X-VieNeu-Merged-Into"] = leader
-    ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
+    ignored = [k for k in ("instructions",) if getattr(req, k) is not None]
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
     if req.stream_format == "sse":
