@@ -1,20 +1,29 @@
-"""Speed and pitch for streamed speech, set per request or per sentence.
+"""Speed, pitch, volume and vocal effort for streamed speech, per request or per sentence.
 
-The v3 Turbo model has no speed or pitch control of its own (its speaking
-style comes from the reference voice), so both are applied to the audio it
-makes, chunk by chunk, without waiting for the whole utterance:
+The v3 Turbo model has no speed or pitch control of its own: it speaks the way
+its reference voice speaks. So the natural way ("native", the default) is to
+reshape the reference and let the model follow it; measured over 3 voices x 2
+texts it follows a sped-up reference ~83 % of the way in log-speed (x1.25 ->
+x1.23, x1.5 -> x1.40, x0.8 -> x0.85) and a pitched one ~97 % (+-3, +-6
+semitones). The small rest is applied to the output with the DSP below, which
+is also the whole job in "dsp" mode:
 
 * pitch: resample by ``2**(semitones/12)`` (soxr) — shifts pitch and tempo;
 * speed: WSOLA time-stretch that also undoes the tempo change of the pitch step.
 
+The model ignores the reference's loudness (the codec normalises it), so
+``volume`` is a gain on the output. ``effort`` (0-2) makes the reference
+higher, faster, brighter and saturated, as a raised / shouting voice is; the
+model then speaks with more strain (1 = raised, 2 = shouting).
+
 Inline tags in the text change them from that point on::
 
     Bình thường. [speed=1.3] Câu này nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm.
-    [voice=Mai Anh] Đổi giọng giữa chừng. [reset] Về lại giá trị của request.
+    [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về như cũ.
 
 Keys: ``speed`` (0.25-4, best 0.7-1.5), ``pitch`` (semitones, -12..12),
-``voice`` (a voice name). Other bracketed text (``[cười]``, ``[thở dài]``...) is
-left in the text for the model.
+``volume`` (gain, 0.1-4), ``effort`` (alias ``shout``, 0-2), ``voice`` (a voice
+name). Other bracketed text (``[cười]``, ``[thở dài]``...) is left for the model.
 """
 from __future__ import annotations
 
@@ -27,10 +36,12 @@ import numpy as np
 
 SPEED_RANGE = (0.25, 4.0)
 PITCH_RANGE = (-12.0, 12.0)
+VOLUME_RANGE = (0.1, 4.0)
+EFFORT_RANGE = (0.0, 2.0)
 
-_KEYS = ("speed", "pitch", "voice")
+_NUM_KEYS = {"speed": "speed", "pitch": "pitch", "volume": "volume", "effort": "effort", "shout": "effort"}
 _TAG_RE = re.compile(r"\[([^\[\]]*)\]")
-_KEY_RE = re.compile(r"(?:^|\s+)(speed|pitch|voice)\s*=\s*", re.IGNORECASE)
+_KEY_RE = re.compile(r"(?:^|\s+)(speed|pitch|volume|effort|shout|voice)\s*=\s*", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,8 @@ class Prosody:
     speed: float = 1.0
     pitch: float = 0.0
     voice: Optional[str] = None
+    volume: float = 1.0
+    effort: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -64,10 +77,11 @@ def _parse_tag(body: str) -> Optional[dict]:
 
 
 def _check(p: Prosody) -> Prosody:
-    if not (SPEED_RANGE[0] <= p.speed <= SPEED_RANGE[1]) or math.isnan(p.speed):
-        raise ProsodyError(f"speed must be in {SPEED_RANGE[0]}..{SPEED_RANGE[1]}, got {p.speed}")
-    if not (PITCH_RANGE[0] <= p.pitch <= PITCH_RANGE[1]) or math.isnan(p.pitch):
-        raise ProsodyError(f"pitch must be in {PITCH_RANGE[0]}..{PITCH_RANGE[1]} semitones, got {p.pitch}")
+    for name, (lo, hi), unit in (("speed", SPEED_RANGE, ""), ("pitch", PITCH_RANGE, " semitones"),
+                                 ("volume", VOLUME_RANGE, ""), ("effort", EFFORT_RANGE, "")):
+        v = getattr(p, name)
+        if math.isnan(v) or not (lo <= v <= hi):
+            raise ProsodyError(f"{name} must be in {lo:g}..{hi:g}{unit}, got {v:g}")
     return p
 
 
@@ -98,10 +112,9 @@ def split_prosody(text: str, base: Prosody = Prosody()) -> List[Part]:
             continue
         upd = {}
         try:
-            if "speed" in kv:
-                upd["speed"] = float(kv["speed"])
-            if "pitch" in kv:
-                upd["pitch"] = float(kv["pitch"])
+            for k, field in _NUM_KEYS.items():
+                if k in kv:
+                    upd[field] = float(kv[k])
         except ValueError:
             raise ProsodyError(f"bad number in tag [{m.group(1)}]") from None
         if "voice" in kv:
@@ -113,6 +126,80 @@ def split_prosody(text: str, base: Prosody = Prosody()) -> List[Part]:
 
 def has_tags(text: str) -> bool:
     return any(_parse_tag(m.group(1)) is not None for m in _TAG_RE.finditer(text))
+
+
+# ── native mode: reshape the reference, let the model follow ────────────────
+
+K_SPEED = 0.83          # log(achieved speed) / log(reference speed), measured
+K_PITCH = 0.97          # achieved semitones / reference semitones, measured
+REF_SPEED_RANGE = (0.6, 1.7)   # beyond this the reshaped reference itself degrades
+REF_PITCH_RANGE = (-9.0, 9.0)
+
+
+@dataclass(frozen=True)
+class Plan:
+    """How one part is made: the reference reshaped by ``ref_*``, then the
+    model's output shifted by ``res_*`` (what the model will not do) and gained."""
+    ref_speed: float = 1.0
+    ref_pitch: float = 0.0
+    tilt_db: float = 0.0
+    drive: float = 1.0
+    res_speed: float = 1.0
+    res_pitch: float = 0.0
+    gain: float = 1.0
+
+    @property
+    def reshapes_reference(self) -> bool:
+        return (self.ref_speed, self.ref_pitch, self.tilt_db, self.drive) != (1.0, 0.0, 0.0, 1.0)
+
+
+def _q(x: float, step: float) -> float:
+    return round(round(x / step) * step, 6)
+
+
+def plan_for(p: Prosody, native: bool = True) -> Plan:
+    """Split ``p`` between the reference (native) and the output DSP. Reference
+    values are quantised (speed 0.05, pitch 0.5 st) so few variants get built;
+    the residual makes up the exact target from the quantised values."""
+    gain = p.volume * 10 ** (1.5 * p.effort / 20)          # a raised voice is louder too
+    if not native:
+        return Plan(res_speed=p.speed, res_pitch=p.pitch, gain=gain)
+    lo, hi = REF_SPEED_RANGE
+    rs = _q(min(hi, max(lo, p.speed ** (1 / K_SPEED))), 0.05)
+    rp = _q(min(REF_PITCH_RANGE[1], max(REF_PITCH_RANGE[0], p.pitch / K_PITCH)), 0.5)
+    res_s = p.speed / rs ** K_SPEED
+    res_p = p.pitch - K_PITCH * rp
+    e = p.effort                                            # strain on top, not compensated
+    rs_e = _q(min(hi, rs * (1 + 0.12 * e)), 0.05)
+    rp_e = _q(min(12.0, rp + 3.5 * e), 0.5)
+    return Plan(ref_speed=rs_e, ref_pitch=rp_e, tilt_db=_q(5.0 * e, 0.5), drive=_q(1 + e, 0.25),
+                res_speed=1.0 if abs(res_s - 1) < 0.02 else res_s,
+                res_pitch=0.0 if abs(res_p) < 0.25 else res_p, gain=gain)
+
+
+def reshape_reference(wav: np.ndarray, sr: int, plan: Plan) -> np.ndarray:
+    """The reference clip as ``plan`` wants it: tempo, pitch, brightness, strain."""
+    y = np.asarray(wav, np.float32)
+    if plan.ref_speed != 1.0 or plan.ref_pitch != 0.0:
+        sh = Shifter(plan.ref_speed, plan.ref_pitch, sr)
+        y = np.concatenate([sh(y), sh(np.zeros(0, np.float32), last=True)])
+    if plan.tilt_db:
+        from scipy.signal import butter, sosfilt
+        hp = sosfilt(butter(2, 1500, "highpass", fs=sr, output="sos"), y).astype(np.float32)
+        y = y + (10 ** (plan.tilt_db / 20) - 1) * hp
+    if plan.drive != 1.0:
+        y = np.tanh(plan.drive * y / (np.abs(y).max() + 1e-9))
+    return (y / (np.abs(y).max() + 1e-9) * 0.9).astype(np.float32)
+
+
+def apply_gain(x: np.ndarray, gain: float) -> np.ndarray:
+    """Output gain; above 1 a soft limiter keeps peaks under full scale."""
+    if gain == 1.0:
+        return x
+    y = x * np.float32(gain)
+    if gain > 1.0:
+        y = np.tanh(y)
+    return y.astype(np.float32)
 
 
 class Wsola:

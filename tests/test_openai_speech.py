@@ -502,3 +502,53 @@ def test_bad_prosody_is_rejected_up_front(client, eng, body):
 
 def test_instructions_are_still_reported_as_ignored(client, eng):
     assert _speech(client, instructions="vui vẻ").headers["X-VieNeu-Ignored"] == "instructions"
+
+
+# ── native mode: the reference is reshaped, the model speaks it ─────────────
+
+@pytest.fixture
+def native(eng, monkeypatch):
+    plans = []
+
+    def voice_variant(voice, plan):
+        plans.append((voice, plan))
+        return {"speaker_emb": np.zeros(4, np.float32), "codes": np.zeros((2, 16), np.int64)}
+    eng.tts.voice_variant = voice_variant
+    _fresh(eng)
+    return plans
+
+
+def test_native_speed_reshapes_the_reference(client, eng, native):
+    r = _speech(client, response_format="pcm", speed=1.3, voice="Mai Anh")
+    assert r.status_code == 200
+    (voice, plan), = native
+    assert voice == "Mai Anh" and plan.ref_speed > 1.3 and plan.res_speed == 1.0
+    assert isinstance(eng.tts.stream_calls[0]["voice"], dict)   # the reshaped voice
+    assert eng.tts.stream_calls[0]["apply_watermark"] == eng.watermark   # no DSP after
+
+
+def test_native_mode_can_be_turned_off(client, eng, native, monkeypatch):
+    monkeypatch.setenv("VIENEU_PROSODY", "dsp")
+    assert _samples(_speech(client, response_format="pcm", speed=2.0)) == 2400
+    assert native == []
+
+
+def test_volume_alone_keeps_the_voice_and_gains_the_output(client, eng, native):
+    eng.tts.infer_stream = lambda text, **kw: iter([np.full(4800, 0.1, np.float32)])
+    pcm = np.frombuffer(_speech(client, response_format="pcm", volume=0.5).content, np.int16)
+    assert native == [] and abs(pcm.mean() / 32768 - 0.05) < 1e-3
+
+
+def test_effort_tag_strains_the_voice_for_that_part_only(client, eng, native):
+    _speech(client, input="Bình tĩnh. [shout=2] Cút ra khỏi đây! [reset] Xong.")
+    (_, plan), = native
+    assert plan.ref_pitch > 0 and plan.tilt_db > 0 and plan.drive > 1
+    assert [isinstance(c["voice"], dict) for c in eng.tts.stream_calls] == [False, True, False]
+
+
+@pytest.mark.parametrize("body", [{"volume": 0}, {"effort": 3}, {"input": "a [effort=5] b"},
+                                  {"input": "a [volume=9] b"}])
+def test_bad_volume_or_effort_is_rejected(client, eng, body):
+    _fresh(eng)
+    assert _speech(client, **body).status_code in (400, 422)
+    assert eng.tts.stream_calls == []

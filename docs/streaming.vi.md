@@ -86,11 +86,15 @@ Body JSON — các trường của OpenAI cộng vài trường mở rộng:
 | `response_format` | `wav` | `pcm` (s16le mono, không header) · `wav` (header độ dài "không xác định", player phát ngay). `mp3/opus/aac/flac` → `400` |
 | `stream_format` | `audio` | `audio`: body là bytes theo chunked transfer · `sse`: Server-Sent Events (bên dưới) |
 | `sample_rate` | 48000 | 48000 (gốc) · 24000 (chuẩn `pcm` của OpenAI) · 16000 · 8000 — resample từng chunk bằng soxr, không thêm trễ |
-| `speed` | 1.0 | 0.25–4 (đẹp nhất 0.7–1.5). Co giãn thời gian trên audio đang stream, giữ nguyên cao độ |
+| `speed` | 1.0 | 0.25–4 (đẹp nhất 0.7–1.5) |
 | `pitch` | 0 | Bán cung, −12…12. Trường thêm (OpenAI không có) |
+| `volume` | 1.0 | Âm lượng 0.1–4, có giới hạn mềm khi > 1. Trường thêm |
+| `effort` | 0 | Độ gắng giọng 0–2: 1 nói lớn, 2 hét. Trường thêm |
+
+Tốc độ, cao độ và độ gắng giọng do chính model nói ra: giọng tham chiếu được biến đổi (nhanh/chậm, cao/trầm, sáng và căng hơn) và model nói theo — đo được model theo ~83 % mức đổi tốc độ và ~97 % mức đổi cao độ; phần còn thiếu bù bằng co giãn/dịch cao độ nhẹ trên audio ra. Lần đầu dùng một giọng × một mức thì dựng biến thể (~1 s CPU), các lần sau dùng lại. `VIENEU_PROSODY=dsp` thì làm hết bằng DSP trên audio ra.
 | `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết). Tông giọng/cảm xúc đến từ giọng tham chiếu: clone một giọng từ mẫu nói với cảm xúc đó |
 
-Tag trong `input` đổi tốc độ, cao độ hoặc giọng từ chỗ đó trở đi: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` Các tín hiệu `[cười]` `[thở dài]` `[hắng giọng]` vẫn dùng được. Giá trị sai hoặc giọng không có trong tag → 400.
+Tag trong `input` đổi các giá trị này từ chỗ đó trở đi: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` Các tín hiệu `[cười]` `[thở dài]` `[hắng giọng]` vẫn dùng được. Giá trị sai hoặc giọng không có trong tag → 400.
 | `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,8 / 25 / 0,95 / 1,2 | Sampling; cho phép 0–2 / 1–1024 / (0, 1] / 1–2, ngoài khoảng (hoặc NaN) → `400` |
 | `max_chars` | 256 | Độ dài chunk văn bản tối đa, 64–512 |
 

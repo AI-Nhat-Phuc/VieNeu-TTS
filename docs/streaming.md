@@ -89,11 +89,15 @@ JSON body — OpenAI's fields plus a few extras:
 | `response_format` | `wav` | `pcm` (s16le mono, headerless) · `wav` (header with "unknown" length — players start at once). `mp3/opus/aac/flac` → `400` |
 | `stream_format` | `audio` | `audio`: raw bytes, chunked transfer · `sse`: Server-Sent Events (below) |
 | `sample_rate` | 48000 | 48000 (native) · 24000 (OpenAI's `pcm` rate) · 16000 · 8000 — resampled per chunk with soxr, no added latency |
-| `speed` | 1.0 | 0.25–4 (cleanest 0.7–1.5). Time-stretch applied to the streamed audio; pitch is kept |
+| `speed` | 1.0 | 0.25–4 (cleanest 0.7–1.5) |
 | `pitch` | 0 | Semitones, −12…12. Extra field (not OpenAI's) |
+| `volume` | 1.0 | Output gain 0.1–4, soft-limited above 1. Extra field |
+| `effort` | 0 | Vocal strain 0–2: 1 raised voice, 2 shouting. Extra field |
+
+Speed, pitch and effort are spoken by the model itself: the voice's reference is reshaped (sped up, pitched, brightened and strained) and the model follows it — measured ~83 % of the speed change and ~97 % of the pitch change; the small rest is a light time-stretch / pitch-shift on the output. The first request for a new voice × setting builds the variant (~1 s CPU), later ones reuse it. `VIENEU_PROSODY=dsp` does everything as DSP on the output instead.
 | `instructions` | — | Accepted for compatibility, **ignored** (`X-VieNeu-Ignored` header says so). Tone/emotion come from the voice: clone one from a sample spoken in that mood |
 
-Inline tags in `input` change speed, pitch or voice from that point on: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` The cues `[cười]` `[thở dài]` `[hắng giọng]` still work. A bad value or unknown voice in a tag → 400.
+Inline tags in `input` change them from that point on: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` The cues `[cười]` `[thở dài]` `[hắng giọng]` still work. A bad value or unknown voice in a tag → 400.
 | `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.8 / 25 / 0.95 / 1.2 | Sampling; allowed 0–2 / 1–1024 / (0, 1] / 1–2, anything else (or NaN) → `400` |
 | `max_chars` | 256 | Max text chunk length, 64–512 |
 

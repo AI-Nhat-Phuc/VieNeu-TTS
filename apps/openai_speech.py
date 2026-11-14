@@ -27,10 +27,16 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     stream_format    "audio" (default: raw chunked body) | "sse" (Server-Sent
                      Events: {"type":"speech.audio.delta","audio":"<base64>"} ...
                      {"type":"speech.audio.done","usage":{...}})
-    speed            0.25-4 (OpenAI's range; cleanest 0.7-1.5), time-stretch, pitch kept
+    speed            0.25-4 (OpenAI's range; cleanest 0.7-1.5)
     pitch            extra: semitones, -12..12 (0 = the voice as is)
-                     Both can change mid-text with inline tags, from the tag on:
-                     "[speed=1.3]", "[pitch=-2 speed=0.9]", "[voice=Mai Anh]",
+    volume           extra: output gain 0.1-4 (soft-limited above 1)
+    effort           extra: 0-2, vocal strain: 1 raised voice, 2 shouting
+                     Speed, pitch and effort are spoken by the model itself: the
+                     voice's reference is reshaped (memoised, ~1 s the first time)
+                     and only a small rest is DSP. VIENEU_PROSODY=dsp: all DSP.
+                     All can change mid-text with inline tags, from the tag on:
+                     "[speed=1.3]", "[pitch=-2 speed=0.9]", "[effort=2 volume=1.5]",
+                     "[voice=Mai Anh]",
                      "[reset]" (back to the request's values). Non-verbal cues
                      "[cười]" "[thở dài]" "[hắng giọng]" are spoken as before.
                      See src/vieneu_utils/prosody.py.
@@ -114,7 +120,8 @@ from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
 from vieneu_utils.vi_prosody import VOICE_REVISION
-from vieneu_utils.prosody import Part, Prosody, ProsodyError, Shifter, split_prosody
+from vieneu_utils.prosody import (Part, Prosody, ProsodyError, Shifter, apply_gain, plan_for,
+                                   split_prosody)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -548,6 +555,8 @@ class SpeechRequest(BaseModel):
     stream_format: str = "audio"
     speed: Optional[float] = Field(None, ge=0.25, le=4.0, allow_inf_nan=False)
     pitch: float = Field(0.0, ge=-12.0, le=12.0, allow_inf_nan=False)   # semitones
+    volume: float = Field(1.0, ge=0.1, le=4.0, allow_inf_nan=False)     # output gain
+    effort: float = Field(0.0, ge=0.0, le=2.0, allow_inf_nan=False)     # 1 raised, 2 shouting
     instructions: Optional[str] = None
     sample_rate: int = SAMPLE_RATE
     # Bounded so one request cannot break the GPU scheduler every stream shares:
@@ -561,32 +570,41 @@ class SpeechRequest(BaseModel):
 
 def _prosody_parts(req: SpeechRequest):
     """The input cut at its prosody tags (raises ProsodyError on a bad value)."""
-    base = Prosody(req.speed or 1.0, req.pitch, req.voice or None)
+    base = Prosody(req.speed or 1.0, req.pitch, req.voice or None, req.volume, req.effort)
     return split_prosody(req.input, base) or [Part(req.input, base)]
 
 
 def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iterator[np.ndarray]:
     """48 kHz chunks for ``req``: each part of the input spoken in its own voice,
-    at its own speed and pitch. Plain text with neither set is one untouched call."""
+    speed, pitch, volume and effort. Natively (default) the voice's reference is
+    reshaped so the model speaks that way itself and only the small rest is DSP
+    (see vieneu_utils/prosody.py); ``VIENEU_PROSODY=dsp`` does it all as DSP.
+    Plain text with none of them set is one untouched call."""
     parts = _prosody_parts(req)
+    native = os.environ.get("VIENEU_PROSODY", "native") != "dsp" and hasattr(eng.tts, "voice_variant")
     seen: list = []                                  # text chunks of earlier parts, for the monitor
     for part in parts:
         p = part.prosody
-        shift = Shifter(p.speed, p.pitch, SAMPLE_RATE)
+        plan = plan_for(p, native)
+        voice = p.voice
+        if plan.reshapes_reference:
+            voice = eng.tts.voice_variant(p.voice, plan)   # memoised; ~1 s the first time
+        shift = Shifter(plan.res_speed, plan.res_pitch, SAMPLE_RATE)
+        post = not shift.identity or plan.gain != 1.0
         mine: list = []                              # this part's text chunks
 
         def on_seg(i, chunks, base=len(seen), mine=mine):
             mine[:] = chunks
             ACTIVITY.segment(rec, base + i, seen + list(chunks))
         gen = eng.tts.infer_stream(
-            part.text, voice=p.voice, apply_watermark=eng.watermark and shift.identity,
+            part.text, voice=voice, apply_watermark=eng.watermark and not post,
             temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
             repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
             on_segment=on_seg if rec else None,
             lender=_Lender(eng) if eng.run_ahead else None,
         )
         try:
-            if shift.identity:
+            if not post:
                 yield from gen
             else:
                 end = object()
@@ -594,11 +612,11 @@ def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iter
                     last = chunk is end
                     if not last and (chunk is None or len(chunk) == 0):
                         continue
-                    y = shift(np.zeros(0, np.float32) if last else chunk, last=last)
+                    y = apply_gain(shift(np.zeros(0, np.float32) if last else chunk, last=last), plan.gain)
                     if len(y):
                         yield eng.tts._apply_watermark(y) if eng.watermark else y
         finally:
-            gen.close()        # a caller that left frees the engine's stream now, not at GC
+            getattr(gen, "close", lambda: None)()   # a caller that left frees the engine's stream now, not at GC
         seen.extend(mine)
 
 
@@ -789,7 +807,7 @@ MERGES = _Merges()
 def _merge_key(eng: Engine, req: SpeechRequest) -> tuple:
     voice = eng.tts.resolve_voice_name(req.voice) if req.voice else None
     return (req.input, voice, req.temperature, req.top_k, req.top_p, req.repetition_penalty,
-            req.max_chars, req.sample_rate, req.speed or 1.0, req.pitch)
+            req.max_chars, req.sample_rate, req.speed or 1.0, req.pitch, req.volume, req.effort)
 
 
 def _merged_chunks(it: Iterator[np.ndarray], rid: str, rec: dict, rate: int) -> Iterator[np.ndarray]:

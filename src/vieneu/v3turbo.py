@@ -429,6 +429,50 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         logger.info(f"➕ Added voice '{name}'.")
         return name
 
+    VARIANT_CACHE_MAX = 64   # reshaped voices kept (LRU), a few hundred KB each
+
+    def voice_variant(self, voice: Optional[str], plan: Any) -> dict:
+        """``voice`` with its reference reshaped by ``plan`` (a
+        ``vieneu_utils.prosody.Plan``): the codes are decoded back to audio,
+        sped up / pitched / strained, and enrolled again, so the model speaks
+        that way itself. Memoised; the first build of a variant takes ~1 s CPU.
+        Returns a voice dict for ``infer_stream(voice=...)``."""
+        import threading
+        from vieneu_utils.prosody import reshape_reference
+        name = self.resolve_voice_name(voice) if voice else self._default_voice
+        if name is None or name not in self._preset_voices:
+            raise ValueError(f"Voice '{voice}' not found.")
+        preset = self._preset_voices[name]
+        key = (name, id(preset), plan.ref_speed, plan.ref_pitch, plan.tilt_db, plan.drive)
+        if not hasattr(self, "_variants"):
+            from collections import OrderedDict
+            self._variants, self._variants_lock = OrderedDict(), threading.Lock()
+        with self._variants_lock:
+            hit = self._variants.get(key)
+            if hit is not None:
+                self._variants.move_to_end(key)
+                return hit
+        codes = preset.get("codes")
+        if codes is None:
+            raise ValueError(f"Voice '{name}' has no reference codes to reshape.")
+        if self.backend == "pytorch":
+            import torch
+            wav = self.engine._decode_codes(torch.as_tensor(np.asarray(codes), dtype=torch.long))
+            src = reshape_reference(wav, self.sample_rate, plan)
+            emb, new_codes = self.engine.prepare_reference(torch.from_numpy(src)[None], sr=self.sample_rate,
+                                                           denoise=False)
+        else:
+            wav = self.engine._decode_codes(np.asarray(codes))
+            src = reshape_reference(wav, self.sample_rate, plan)
+            emb, new_codes = self.engine.prepare_reference(src, sr=self.sample_rate, denoise=False)
+        out = {"speaker_emb": preset["speaker_emb"] if emb is None else np.asarray(emb, dtype=np.float32),
+               "codes": np.asarray(new_codes, dtype=np.int64)}
+        with self._variants_lock:
+            self._variants[key] = out
+            while len(self._variants) > self.VARIANT_CACHE_MAX:
+                self._variants.popitem(last=False)
+        return out
+
     def remove_voice(self, name: str, save: bool = False) -> None:
         """Remove a registered voice by name."""
         name = self.resolve_voice_name(name) or name
