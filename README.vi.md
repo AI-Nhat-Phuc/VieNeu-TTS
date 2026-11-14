@@ -456,7 +456,7 @@ with client.audio.speech.with_streaming_response.create(
     r.stream_to_file("vui.wav")
 ```
 
-- **Các mức phổ biến được dựng sẵn** cho mọi giọng — `effort` 1 và 2, `speed` 1.2 và 0.85, `pitch` +2 và −2 — ở nền lúc server rảnh, và lưu trên đĩa nên restart không phải dựng lại; dùng chúng thì tiếng đầu đến ngay (~0.3–0.5 s). Mức khác thì lần đầu chậm hơn 2–7 s (dựng giọng biến thể), các lần sau như thường. Các mức được làm tròn (tốc độ 0.05, cao độ 0.5 bán cung) nên số biến thể ít. Tự chạy server thì đổi danh sách bằng `VIENEU_PREWARM` / `VIENEU_PREWARM_VOICES`.
+- **Các mức phổ biến được dựng sẵn** cho mọi giọng — `effort` 1 và 2, `speed` 1.2 và 0.85, `pitch` +2 và −2 — ở nền lúc server rảnh, và lưu trên đĩa nên restart không phải dựng lại; dùng chúng thì tiếng đầu đến ngay (~0.25–0.4 s đo trên tts.falevon.com). Mức khác thì lần đầu chậm hơn ~1 s (dựng giọng biến thể; lâu hơn khi server đang bận), các lần sau như thường. Các mức được làm tròn (tốc độ 0.05, cao độ 0.5 bán cung) nên số biến thể ít. Tự chạy server thì đổi danh sách bằng `VIENEU_PREWARM` / `VIENEU_PREWARM_VOICES`.
 - Giá trị ngoài khoảng hoặc giọng không có trong tag → `400`, trước khi sinh audio.
 - **Cảm xúc khác** (vui, buồn, thì thầm…): `instructions` vẫn bị bỏ qua. Cách giống thật nhất là clone một giọng từ đoạn thu âm đúng cảm xúc đó (`POST /v1/voices`) rồi đổi bằng `[voice=…]` ở câu cần dùng.
 - Chi tiết và số đo: [docs/streaming.vi.md](docs/streaming.vi.md).

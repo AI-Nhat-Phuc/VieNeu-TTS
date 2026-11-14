@@ -446,7 +446,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         """``voice`` with its reference reshaped by ``plan`` (a
         ``vieneu_utils.prosody.Plan``): the codes are decoded back to audio,
         sped up / pitched / strained, and enrolled again, so the model speaks
-        that way itself. Built once (2-7 s on CPU), then kept in memory and on
+        that way itself. Built once (~1.3 s on CPU when idle), then kept in memory and on
         disk (see ``_variant_dir``), so a restart does not build it again.
         Returns a voice dict for ``infer_stream(voice=...)``."""
         import hashlib
