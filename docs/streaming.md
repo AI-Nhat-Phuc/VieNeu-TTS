@@ -92,7 +92,7 @@ JSON body — OpenAI's fields plus a few extras:
 | `speed` | 1.0 | 0.25–4 (cleanest 0.7–1.5) |
 | `pitch` | 0 | Semitones, −12…12. Extra field (not OpenAI's) |
 | `volume` | 1.0 | Output gain 0.1–4, soft-limited above 1. Extra field |
-| `effort` | 0 | Vocal strain 0–2: 1 raised voice, 2 shouting. Extra field |
+| `effort` | 0 | Vocal strain 0–2: 1 raised voice, 2 shouting. Stays loud to the end of the sentence: each clause is generated on its own from a reference cut to its energetic opening, and a leveler holds the loudness. Extra field |
 
 Speed, pitch and effort are spoken by the model itself: the voice's reference is reshaped (sped up, pitched, brightened and strained) and the model follows it — measured ~83 % of the speed change and ~97 % of the pitch change; the small rest is a light time-stretch / pitch-shift on the output. The first request for a new voice × setting builds the variant (~1 s CPU), later ones reuse it. `VIENEU_PROSODY=dsp` does everything as DSP on the output instead.
 | `instructions` | — | Accepted for compatibility, **ignored** (`X-VieNeu-Ignored` header says so). Tone/emotion come from the voice: clone one from a sample spoken in that mood |

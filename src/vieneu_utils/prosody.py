@@ -14,7 +14,11 @@ is also the whole job in "dsp" mode:
 The model ignores the reference's loudness (the codec normalises it), so
 ``volume`` is a gain on the output. ``effort`` (0-2) makes the reference
 higher, faster, brighter and saturated, as a raised / shouting voice is; the
-model then speaks with more strain (1 = raised, 2 = shouting).
+model then speaks with more strain (1 = raised, 2 = shouting). A shout stays
+loud to the end, where a narrator trails off, so with effort the reference is
+built from its energetic opening only, each clause is generated on its own
+(the model starts every clause with fresh breath) and a leveler holds the
+loudness steady across the sentence.
 
 Inline tags in the text change them from that point on::
 
@@ -147,10 +151,13 @@ class Plan:
     res_speed: float = 1.0
     res_pitch: float = 0.0
     gain: float = 1.0
+    head: bool = False                 # reference = its energetic opening, looped
+    level_db: Optional[float] = None   # hold loudness at this dBFS (None = off)
+    by_clause: bool = False            # one generation per clause
 
     @property
     def reshapes_reference(self) -> bool:
-        return (self.ref_speed, self.ref_pitch, self.tilt_db, self.drive) != (1.0, 0.0, 0.0, 1.0)
+        return (self.ref_speed, self.ref_pitch, self.tilt_db, self.drive, self.head) != (1.0, 0.0, 0.0, 1.0, False)
 
 
 def _q(x: float, step: float) -> float:
@@ -161,25 +168,29 @@ def plan_for(p: Prosody, native: bool = True) -> Plan:
     """Split ``p`` between the reference (native) and the output DSP. Reference
     values are quantised (speed 0.05, pitch 0.5 st) so few variants get built;
     the residual makes up the exact target from the quantised values."""
-    gain = p.volume * 10 ** (1.5 * p.effort / 20)          # a raised voice is louder too
+    gain = p.volume
+    e = p.effort
+    strain = dict(level_db=-18.0 + 2.0 * e, by_clause=True) if e > 0 else {}
     if not native:
-        return Plan(res_speed=p.speed, res_pitch=p.pitch, gain=gain)
+        return Plan(res_speed=p.speed, res_pitch=p.pitch, gain=gain, **strain)
     lo, hi = REF_SPEED_RANGE
     rs = _q(min(hi, max(lo, p.speed ** (1 / K_SPEED))), 0.05)
     rp = _q(min(REF_PITCH_RANGE[1], max(REF_PITCH_RANGE[0], p.pitch / K_PITCH)), 0.5)
     res_s = p.speed / rs ** K_SPEED
     res_p = p.pitch - K_PITCH * rp
-    e = p.effort                                            # strain on top, not compensated
+    # strain on top, not compensated
     rs_e = _q(min(hi, rs * (1 + 0.12 * e)), 0.05)
     rp_e = _q(min(12.0, rp + 3.5 * e), 0.5)
     return Plan(ref_speed=rs_e, ref_pitch=rp_e, tilt_db=_q(5.0 * e, 0.5), drive=_q(1 + e, 0.25),
                 res_speed=1.0 if abs(res_s - 1) < 0.02 else res_s,
-                res_pitch=0.0 if abs(res_p) < 0.25 else res_p, gain=gain)
+                res_pitch=0.0 if abs(res_p) < 0.25 else res_p, gain=gain, head=e > 0, **strain)
 
 
 def reshape_reference(wav: np.ndarray, sr: int, plan: Plan) -> np.ndarray:
     """The reference clip as ``plan`` wants it: tempo, pitch, brightness, strain."""
     y = np.asarray(wav, np.float32)
+    if plan.head:
+        y = energetic_head(y, sr)
     if plan.ref_speed != 1.0 or plan.ref_pitch != 0.0:
         sh = Shifter(plan.ref_speed, plan.ref_pitch, sr)
         y = np.concatenate([sh(y), sh(np.zeros(0, np.float32), last=True)])
@@ -190,6 +201,86 @@ def reshape_reference(wav: np.ndarray, sr: int, plan: Plan) -> np.ndarray:
     if plan.drive != 1.0:
         y = np.tanh(plan.drive * y / (np.abs(y).max() + 1e-9))
     return (y / (np.abs(y).max() + 1e-9) * 0.9).astype(np.float32)
+
+
+def energetic_head(wav: np.ndarray, sr: int, frac: float = 0.45, total_s: float = 6.5) -> np.ndarray:
+    """The first ``frac`` of the speech in ``wav`` (before a narrator's voice
+    falls), looped with short pauses to ``total_s``."""
+    y = np.asarray(wav, np.float32)
+    hop = max(1, sr // 100)
+    n = len(y) // hop
+    if n < 10:
+        return y
+    rms = np.sqrt((y[:n * hop].reshape(n, hop) ** 2).mean(1))
+    act = np.where(rms > 0.1 * rms.max())[0]
+    a = act[0] * hop
+    b = a + max(int((act[-1] - act[0]) * hop * frac), sr // 2)
+    head = y[a:b].copy()
+    f = min(len(head) // 4, sr // 100)
+    if f:
+        ramp = np.linspace(0, 1, f, dtype=np.float32)
+        head[:f] *= ramp
+        head[-f:] *= ramp[::-1]
+    unit = np.concatenate([head, np.zeros(int(0.15 * sr), np.float32)])
+    reps = int(np.ceil(total_s * sr / len(unit)))
+    return np.tile(unit, reps)[: int(total_s * sr)]
+
+
+_CLAUSE_RE = re.compile(r"[^,;:!?.…]+[,;:!?.…]*")
+
+
+def clauses(text: str) -> List[str]:
+    """``text`` cut after each , ; : ! ? . (the mark stays with its clause).
+    Bracketed cues stay whole; pieces without a word join the one before."""
+    out: List[str] = []
+    for c in _CLAUSE_RE.findall(text):
+        if out and (not re.search(r"\w", c) or out[-1].count("[") > out[-1].count("]")):
+            out[-1] += c
+        elif c.strip():
+            out.append(c)
+    return [c.strip() for c in out if c.strip()] or [text]
+
+
+class Leveler:
+    """Streaming loudness leveler: follows the RMS (fast attack, slow release)
+    and gains speech toward ``target_db`` dBFS, at most ``max_boost_db`` up;
+    pauses (under -40 dBFS) keep the gain they had. Ends in a soft limiter.
+    No look-ahead, so no added latency."""
+
+    def __init__(self, target_db: float, sr: int = 48000, max_boost_db: float = 12.0,
+                 attack: float = 0.01, release: float = 0.35):
+        self.hop = max(1, sr // 200)
+        self.target = 10 ** (target_db / 20)
+        self.max_g = 10 ** (max_boost_db / 20)
+        self.a_att = math.exp(-self.hop / (attack * sr))
+        self.a_rel = math.exp(-self.hop / (release * sr))
+        self.gate = 10 ** (-40 / 20)
+        self.env, self.g = None, 1.0
+        self.carry = np.zeros(0, np.float32)
+
+    def __call__(self, x: np.ndarray, last: bool = False) -> np.ndarray:
+        x = np.concatenate([self.carry, np.asarray(x, np.float32)])
+        size = len(x)                       # real samples; the last hop may be padded
+        n = len(x) // self.hop
+        if last and size > n * self.hop:
+            x = np.concatenate([x, np.zeros((n + 1) * self.hop - size, np.float32)])
+            n += 1
+        body, self.carry = x[:n * self.hop], x[n * self.hop:]
+        if n == 0:
+            return np.zeros(0, np.float32)
+        out_len = min(size, n * self.hop)
+        rms = np.sqrt((body.reshape(n, self.hop) ** 2).mean(1)) + 1e-9
+        gains = np.empty(n, np.float32)
+        for i in range(n):
+            r = rms[i]
+            if self.env is None:
+                self.env = r
+            a = self.a_att if r > self.env else self.a_rel
+            self.env = a * self.env + (1 - a) * r
+            if self.env > self.gate:
+                self.g = 0.9 * self.g + 0.1 * min(self.max_g, self.target / self.env)
+            gains[i] = self.g
+        return np.tanh(body * np.repeat(gains, self.hop))[:out_len].astype(np.float32)
 
 
 def apply_gain(x: np.ndarray, gain: float) -> np.ndarray:
@@ -289,7 +380,7 @@ class Wsola:
         y = self._emit(pieces, limit=want)
         short = want - self.out_n          # never short: pad with silence
         if short > 0:
-            y =np.concatenate([y, np.zeros(short, np.float32)])
+            y = np.concatenate([y, np.zeros(short, np.float32)])
             self.out_n += short
         return y
 

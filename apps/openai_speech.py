@@ -120,8 +120,10 @@ from pydantic import BaseModel, Field
 
 from vieneu import Vieneu
 from vieneu_utils.vi_prosody import VOICE_REVISION
-from vieneu_utils.prosody import (Part, Prosody, ProsodyError, Shifter, apply_gain, plan_for,
-                                   split_prosody)
+from vieneu_utils.prosody import (Leveler, Part, Prosody, ProsodyError, Shifter, apply_gain,
+                                   clauses, plan_for, split_prosody)
+
+CLAUSE_GAP_S = 0.12   # pause between the clauses of a shout, each generated on its own
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vieneu.api")
@@ -579,10 +581,12 @@ def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iter
     speed, pitch, volume and effort. Natively (default) the voice's reference is
     reshaped so the model speaks that way itself and only the small rest is DSP
     (see vieneu_utils/prosody.py); ``VIENEU_PROSODY=dsp`` does it all as DSP.
+    With effort each clause is its own generation and a leveler holds the
+    loudness, so a shout stays loud to the end.
     Plain text with none of them set is one untouched call."""
     parts = _prosody_parts(req)
     native = os.environ.get("VIENEU_PROSODY", "native") != "dsp" and hasattr(eng.tts, "voice_variant")
-    seen: list = []                                  # text chunks of earlier parts, for the monitor
+    seen: list = []                                  # text chunks of earlier calls, for the monitor
     for part in parts:
         p = part.prosody
         plan = plan_for(p, native)
@@ -590,34 +594,48 @@ def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iter
         if plan.reshapes_reference:
             voice = eng.tts.voice_variant(p.voice, plan)   # memoised; ~1 s the first time
         shift = Shifter(plan.res_speed, plan.res_pitch, SAMPLE_RATE)
-        post = not shift.identity or plan.gain != 1.0
-        mine: list = []                              # this part's text chunks
+        level = Leveler(plan.level_db, SAMPLE_RATE) if plan.level_db is not None else None
+        post = not shift.identity or plan.gain != 1.0 or level is not None
+        texts = clauses(part.text) if plan.by_clause else [part.text]
+        gap = np.zeros(int(CLAUSE_GAP_S * SAMPLE_RATE), np.float32)
 
-        def on_seg(i, chunks, base=len(seen), mine=mine):
-            mine[:] = chunks
-            ACTIVITY.segment(rec, base + i, seen + list(chunks))
-        gen = eng.tts.infer_stream(
-            part.text, voice=voice, apply_watermark=eng.watermark and not post,
-            temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
-            repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
-            on_segment=on_seg if rec else None,
-            lender=_Lender(eng) if eng.run_ahead else None,
-        )
-        try:
-            if not post:
-                yield from gen
-            else:
-                end = object()
-                for chunk in itertools.chain(gen, (end,)):
-                    last = chunk is end
-                    if not last and (chunk is None or len(chunk) == 0):
-                        continue
-                    y = apply_gain(shift(np.zeros(0, np.float32) if last else chunk, last=last), plan.gain)
-                    if len(y):
-                        yield eng.tts._apply_watermark(y) if eng.watermark else y
-        finally:
-            getattr(gen, "close", lambda: None)()   # a caller that left frees the engine's stream now, not at GC
-        seen.extend(mine)
+        def raw() -> Iterator[np.ndarray]:
+            """The model's audio for this part, clause after clause."""
+            for k, text in enumerate(texts):
+                mine: list = []
+
+                def on_seg(i, chunks, base=len(seen), mine=mine):
+                    mine[:] = chunks
+                    ACTIVITY.segment(rec, base + i, seen + list(chunks))
+                gen = eng.tts.infer_stream(
+                    text, voice=voice, apply_watermark=eng.watermark and not post,
+                    temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
+                    repetition_penalty=req.repetition_penalty, max_chars=req.max_chars,
+                    on_segment=on_seg if rec else None,
+                    lender=_Lender(eng) if eng.run_ahead else None,
+                )
+                try:
+                    if k:
+                        yield gap
+                    yield from gen
+                finally:
+                    getattr(gen, "close", lambda: None)()   # a caller that left frees the stream now
+                seen.extend(mine)
+
+        if not post:
+            yield from raw()
+            continue
+        end = object()
+        for chunk in itertools.chain(raw(), (end,)):
+            last = chunk is end
+            if not last and (chunk is None or len(chunk) == 0):
+                continue
+            y = shift(np.zeros(0, np.float32) if last else chunk, last=last)
+            if level is not None:
+                y = level(y, last=last)
+            y = apply_gain(y, plan.gain)
+            if len(y):
+                yield eng.tts._apply_watermark(y) if eng.watermark else y
 
 
 def _speech_chunks(eng: Engine, req: SpeechRequest, rid: str, slot: _Slot,

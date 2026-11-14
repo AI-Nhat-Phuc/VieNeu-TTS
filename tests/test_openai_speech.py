@@ -552,3 +552,24 @@ def test_bad_volume_or_effort_is_rejected(client, eng, body):
     _fresh(eng)
     assert _speech(client, **body).status_code in (400, 422)
     assert eng.tts.stream_calls == []
+
+
+def test_a_shout_is_generated_clause_by_clause(client, eng, native):
+    _speech(client, input="[effort=2] Anh im đi! Tôi nói rồi, cút ra!")
+    assert [t.strip() for t in eng.tts.texts] == ["Anh im đi!", "Tôi nói rồi,", "cút ra!"]
+    (_, plan), = native                         # one variant, reused by every clause
+    assert plan.head and plan.level_db is not None
+
+
+def test_shout_keeps_its_loudness_to_the_end():
+    from vieneu_utils.prosody import Leveler
+    sr = 48000
+    t = np.arange(4 * sr) / sr
+    fading = (np.sin(2 * np.pi * 200 * t) * np.linspace(0.3, 0.06, len(t))).astype(np.float32)
+    lv = Leveler(-14.0, sr)
+    y = np.concatenate([lv(fading[i:i + 2400]) for i in range(0, len(t), 2400)]
+                       + [lv(np.zeros(0, np.float32), last=True)])
+    assert len(y) == len(fading)
+    db = lambda a: 20 * np.log10(np.sqrt(np.mean(a ** 2)))
+    assert db(fading[-sr:]) - db(fading[:sr]) < -8           # the input falls ~9 dB
+    assert abs(db(y[-sr:]) - db(y[sr:2 * sr])) < 2           # the output holds

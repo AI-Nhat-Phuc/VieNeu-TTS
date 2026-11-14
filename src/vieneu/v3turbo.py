@@ -443,7 +443,8 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         if name is None or name not in self._preset_voices:
             raise ValueError(f"Voice '{voice}' not found.")
         preset = self._preset_voices[name]
-        key = (name, id(preset), plan.ref_speed, plan.ref_pitch, plan.tilt_db, plan.drive)
+        key = (name, id(preset), plan.ref_speed, plan.ref_pitch, plan.tilt_db, plan.drive,
+               getattr(plan, "head", False))
         if not hasattr(self, "_variants"):
             from collections import OrderedDict
             self._variants, self._variants_lock = OrderedDict(), threading.Lock()
