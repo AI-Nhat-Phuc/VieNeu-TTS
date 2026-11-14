@@ -74,7 +74,7 @@
 
 1. [🦜 Installation & Web UI](#installation)
 2. [📦 Using the Python SDK](#sdk)
-3. [🐳 API Server & Docker](#docker-remote) — OpenAI-compatible streaming API (v3 Turbo) · legacy v2 server
+3. [🐳 API Server & Docker](#docker-remote) — OpenAI-compatible streaming API (v3 Turbo) · hosted endpoint `tts.falevon.com` · legacy v2 server
 4. [📊 Benchmarks](#benchmarks) — every speed / latency number in one place (CPU vs GPU, batch, streaming, Nano)
 5. [🎓 Fine-tuning (LoRA)](#finetune)
 6. [🔬 Model Overview](#backbones)
@@ -380,6 +380,41 @@ with client.audio.speech.with_streaming_response.create(
 ```
 
 Endpoints: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v1/voices` (clone from an uploaded clip), `GET /health`, `GET /debug/activity` (loopback only, for the monitor). Concurrency is capped per backend (`VIENEU_MAX_STREAMS`, default 16 on GPU / 1 on CPU) with a small queue and `429` beyond it.
+
+#### Hosted endpoint — `https://tts.falevon.com`
+
+The same API runs publicly at **`https://tts.falevon.com`** (v3 Turbo, llama.cpp backbone, **6 concurrent streams**, behind a Cloudflare Tunnel). It is used by [Falevon](https://www.falevon.com) for chapter narration; you can call it like a local server with base URL `https://tts.falevon.com/v1`.
+
+- **API key**: every `/v1/*` call needs `Authorization: Bearer <key>`; a missing or wrong key gets `401 invalid api key`. Ask the maintainer for one and keep it on your server — never ship it in a web page or mobile app. `GET /health` needs no key.
+- **Audio**: `pcm` (s16le mono, no header) or `wav`; 48 kHz by default, or `sample_rate` 24000 / 16000 / 8000. mp3 / opus / aac / flac are not supported (`400`). `speed` and `instructions` are accepted and ignored.
+- **Voices**: any preset from [Available Voices](#available-voices) (`GET /v1/voices` lists them); no `voice` = **Hải Đăng**. Voices added with `POST /v1/voices` live only in memory until the server restarts.
+- **Busy**: past 6 streams a request waits up to 10 s in a short queue, then gets `429` with `Retry-After`. Send `X-VieNeu-No-Wait: 1` to get the `429` at once instead (e.g. when prefetching the next sentence). A `503` means the engine is restarting; retry after a few seconds.
+
+```bash
+export VIENEU_API_KEY=...   # your key
+
+curl -s https://tts.falevon.com/health      # {"status":"ok","backend":"onnx","max_streams":6,"active":0,...}
+
+curl -sS https://tts.falevon.com/v1/audio/speech \
+  -H "Authorization: Bearer $VIENEU_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"vieneu-v3-turbo","voice":"Mai Anh","input":"Xin chào từ tts.falevon.com!","response_format":"wav"}' \
+  -o hello.wav
+
+# Same benchmark client as above, against the hosted server
+uv run python examples/openai_speech_client.py --base https://tts.falevon.com --api-key "$VIENEU_API_KEY" --voice "Mai Anh"
+```
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="https://tts.falevon.com/v1", api_key=os.environ["VIENEU_API_KEY"])
+with client.audio.speech.with_streaming_response.create(
+    model="vieneu-v3-turbo", voice="Mai Anh", input="Xin chào từ tts.falevon.com!",
+    response_format="wav",
+) as r:
+    r.stream_to_file("hello.wav")      # or r.iter_bytes(4096) to play while it streams
+```
 
 #### Desktop monitor (Windows)
 
