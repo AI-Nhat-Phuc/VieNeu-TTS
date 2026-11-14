@@ -91,7 +91,7 @@ Body JSON — các trường của OpenAI cộng vài trường mở rộng:
 | `volume` | 1.0 | Âm lượng 0.1–4, có giới hạn mềm khi > 1. Trường thêm |
 | `effort` | 0 | Độ gắng giọng 0–2: 1 nói lớn, 2 hét. Giữ to đến hết câu: mỗi vế sinh riêng, từ tham chiếu chỉ lấy đoạn đầu còn mạnh, và độ to được san đều. Trường thêm |
 
-Tốc độ, cao độ và độ gắng giọng do chính model nói ra: giọng tham chiếu được biến đổi (nhanh/chậm, cao/trầm, sáng và căng hơn) và model nói theo — đo được model theo ~83 % mức đổi tốc độ và ~97 % mức đổi cao độ; phần còn thiếu bù bằng co giãn/dịch cao độ nhẹ trên audio ra. Lần đầu dùng một giọng × một mức thì dựng biến thể (~1 s CPU), các lần sau dùng lại. `VIENEU_PROSODY=dsp` thì làm hết bằng DSP trên audio ra.
+Tốc độ, cao độ và độ gắng giọng do chính model nói ra: giọng tham chiếu được biến đổi (nhanh/chậm, cao/trầm, sáng và căng hơn) và model nói theo — đo được model theo ~83 % mức đổi tốc độ và ~97 % mức đổi cao độ; phần còn thiếu bù bằng co giãn/dịch cao độ nhẹ trên audio ra. Lần đầu dùng một giọng × một mức thì dựng biến thể (tiếng đầu chậm thêm 2–7 s trên server CPU dùng sẵn), các lần sau dùng lại. `VIENEU_PROSODY=dsp` thì làm hết bằng DSP trên audio ra.
 | `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết). Tông giọng/cảm xúc đến từ giọng tham chiếu: clone một giọng từ mẫu nói với cảm xúc đó |
 
 Tag trong `input` đổi các giá trị này từ chỗ đó trở đi: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` Các tín hiệu `[cười]` `[thở dài]` `[hắng giọng]` vẫn dùng được. Giá trị sai hoặc giọng không có trong tag → 400.

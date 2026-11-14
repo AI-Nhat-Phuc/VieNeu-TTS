@@ -32,7 +32,7 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     volume           extra: output gain 0.1-4 (soft-limited above 1)
     effort           extra: 0-2, vocal strain: 1 raised voice, 2 shouting
                      Speed, pitch and effort are spoken by the model itself: the
-                     voice's reference is reshaped (memoised, ~1 s the first time)
+                     voice's reference is reshaped (memoised; 2-7 s the first time on CPU)
                      and only a small rest is DSP. VIENEU_PROSODY=dsp: all DSP.
                      All can change mid-text with inline tags, from the tag on:
                      "[speed=1.3]", "[pitch=-2 speed=0.9]", "[effort=2 volume=1.5]",
@@ -592,7 +592,7 @@ def _shaped_stream(eng: Engine, req: SpeechRequest, rec: Optional[dict]) -> Iter
         plan = plan_for(p, native)
         voice = p.voice
         if plan.reshapes_reference:
-            voice = eng.tts.voice_variant(p.voice, plan)   # memoised; ~1 s the first time
+            voice = eng.tts.voice_variant(p.voice, plan)   # memoised; 2-7 s the first time on CPU
         shift = Shifter(plan.res_speed, plan.res_pitch, SAMPLE_RATE)
         level = Leveler(plan.level_db, SAMPLE_RATE) if plan.level_db is not None else None
         post = not shift.identity or plan.gain != 1.0 or level is not None

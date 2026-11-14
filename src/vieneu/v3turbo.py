@@ -435,7 +435,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         """``voice`` with its reference reshaped by ``plan`` (a
         ``vieneu_utils.prosody.Plan``): the codes are decoded back to audio,
         sped up / pitched / strained, and enrolled again, so the model speaks
-        that way itself. Memoised; the first build of a variant takes ~1 s CPU.
+        that way itself. Memoised; the first build of a variant takes 2-7 s on CPU.
         Returns a voice dict for ``infer_stream(voice=...)``."""
         import threading
         from vieneu_utils.prosody import reshape_reference

@@ -386,7 +386,7 @@ Endpoints: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v
 The same API runs publicly at **`https://tts.falevon.com`** (v3 Turbo, llama.cpp backbone, **6 concurrent streams**, behind a Cloudflare Tunnel). It is used by [Falevon](https://www.falevon.com) for chapter narration; you can call it like a local server with base URL `https://tts.falevon.com/v1`.
 
 - **API key**: every `/v1/*` call needs `Authorization: Bearer <key>`; a missing or wrong key gets `401 invalid api key`. Ask the maintainer for one and keep it on your server — never ship it in a web page or mobile app. `GET /health` needs no key.
-- **Audio**: `pcm` (s16le mono, no header) or `wav`; 48 kHz by default, or `sample_rate` 24000 / 16000 / 8000. mp3 / opus / aac / flac are not supported (`400`). `speed` and `instructions` are accepted and ignored.
+- **Audio**: `pcm` (s16le mono, no header) or `wav`; 48 kHz by default, or `sample_rate` 24000 / 16000 / 8000. mp3 / opus / aac / flac are not supported (`400`). `speed`, `pitch`, `volume` and `effort` shape the voice (see below); `instructions` is accepted and ignored.
 - **Voices**: any preset from [Available Voices](#available-voices) (`GET /v1/voices` lists them); no `voice` = **Hải Đăng**. Voices added with `POST /v1/voices` live only in memory until the server restarts.
 - **Busy**: past 6 streams a request waits up to 10 s in a short queue, then gets `429` with `Retry-After`. Send `X-VieNeu-No-Wait: 1` to get the `429` at once instead (e.g. when prefetching the next sentence). A `503` means the engine is restarting; retry after a few seconds.
 
@@ -415,6 +415,48 @@ with client.audio.speech.with_streaming_response.create(
 ) as r:
     r.stream_to_file("hello.wav")      # or r.iter_bytes(4096) to play while it streams
 ```
+
+#### Speed, pitch, volume and shouting — per request or per sentence
+
+v3 Turbo speaks the way its reference voice speaks, so the server **reshapes the reference and lets the model say it** (faster/slower, higher/lower, strained) — far more natural than stretching the audio afterwards. The small part the model does not follow is made up with light processing on the output.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `speed` | 1.0 | Speaking rate, 0.25–4 (cleanest 0.7–1.5) |
+| `pitch` | 0 | Pitch in semitones, −12…12 (`+3` higher, `-3` lower) |
+| `volume` | 1.0 | Loudness, 0.1–4 (soft-limited, never clips) |
+| `effort` | 0 | Vocal strain, 0–2: `1` raised voice, `2` shouting. Stays loud to the end |
+
+Change them mid-text with **tags in `input`**, from the tag on:
+
+| Tag | Effect |
+|---|---|
+| `[speed=1.3]` `[pitch=-2]` `[volume=0.7]` | change one value |
+| `[effort=2]` or `[shout=2]` | shout (every clause as loud) |
+| `[speed=0.85 pitch=-3]` | change several at once |
+| `[voice=Mai Anh]` | switch voice |
+| `[reset]` | back to the request's values |
+| `[cười]` `[thở dài]` `[hắng giọng]` | non-verbal cues, as before |
+
+```bash
+curl -sS https://tts.falevon.com/v1/audio/speech   -H "Authorization: Bearer $VIENEU_API_KEY" -H "Content-Type: application/json"   -d '{"voice":"Hải Đăng","response_format":"wav",
+       "input":"Bình tĩnh nào. [effort=2] Anh im ngay đi! Tôi đã nói bao nhiêu lần rồi, cút ra khỏi đây! [reset] Xin lỗi, tôi hơi nóng. [speed=0.85 pitch=-2] Thôi, mình nói chuyện tử tế nhé."}'   -o angry.wav
+```
+
+```python
+# OpenAI SDK: `speed` is built in; send pitch / volume / effort through extra_body
+with client.audio.speech.with_streaming_response.create(
+    model="vieneu-v3-turbo", voice="Mai Anh", response_format="wav", speed=1.2,
+    input="Tin vui đây! [volume=1.3] Chúng ta thắng rồi!",
+    extra_body={"pitch": 2},
+) as r:
+    r.stream_to_file("happy.wav")
+```
+
+- The **first** request for a voice at a new setting builds the variant, so its first audio comes 2–7 s later (measured on tts.falevon.com, CPU); later ones reuse it and start in ~0.3–0.5 s as usual. Settings are rounded (speed 0.05, pitch 0.5 semitone), so there are few variants.
+- An out-of-range value or an unknown voice in a tag → `400`, before any audio.
+- **Other emotions** (happy, sad, whispering…): `instructions` is still ignored. The most convincing way is to clone a voice from a clip spoken in that mood (`POST /v1/voices`) and switch to it with `[voice=…]`.
+- Details and measurements: [docs/streaming.md](docs/streaming.md).
 
 #### Desktop monitor (Windows)
 

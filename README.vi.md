@@ -389,7 +389,7 @@ Endpoint: `POST /v1/audio/speech`, `GET /v1/models`, `GET /v1/voices`, `POST /v1
 API này đang chạy công khai tại **`https://tts.falevon.com`** (v3 Turbo, backbone llama.cpp, **6 luồng đồng thời**, đứng sau Cloudflare Tunnel). [Falevon](https://www.falevon.com) dùng nó để đọc truyện; bạn gọi y như server chạy ở máy, với base URL `https://tts.falevon.com/v1`.
 
 - **API key**: mọi lệnh gọi `/v1/*` cần header `Authorization: Bearer <key>`; thiếu hoặc sai key sẽ nhận `401 invalid api key`. Xin key từ người quản lý và chỉ để key ở phía server — đừng nhúng vào trang web hay app di động. `GET /health` không cần key.
-- **Âm thanh**: `pcm` (s16le mono, không header) hoặc `wav`; mặc định 48 kHz, hoặc đặt `sample_rate` 24000 / 16000 / 8000. Không hỗ trợ mp3 / opus / aac / flac (`400`). `speed` và `instructions` được nhận nhưng bỏ qua.
+- **Âm thanh**: `pcm` (s16le mono, không header) hoặc `wav`; mặc định 48 kHz, hoặc đặt `sample_rate` 24000 / 16000 / 8000. Không hỗ trợ mp3 / opus / aac / flac (`400`). `speed`, `pitch`, `volume`, `effort` chỉnh được giọng (xem bên dưới); `instructions` được nhận nhưng bỏ qua.
 - **Giọng**: mọi giọng trong [Các giọng dựng sẵn](#các-giọng-dựng-sẵn) (`GET /v1/voices` liệt kê đủ); không truyền `voice` thì dùng **Hải Đăng**. Giọng thêm bằng `POST /v1/voices` chỉ nằm trong bộ nhớ, mất khi server khởi động lại.
 - **Khi bận**: quá 6 luồng thì request chờ tối đa 10 s trong hàng đợi ngắn, rồi nhận `429` kèm `Retry-After`. Gửi header `X-VieNeu-No-Wait: 1` để nhận `429` ngay thay vì chờ (ví dụ khi đọc trước câu kế tiếp). `503` nghĩa là engine đang khởi động lại; thử lại sau vài giây.
 
@@ -418,6 +418,48 @@ with client.audio.speech.with_streaming_response.create(
 ) as r:
     r.stream_to_file("hello.wav")      # hoặc r.iter_bytes(4096) để phát ngay khi đang tải
 ```
+
+#### Tốc độ, cao độ, âm lượng và hét — theo request hoặc theo từng câu
+
+Model v3 Turbo nói theo cách giọng tham chiếu nói, nên server **biến đổi giọng tham chiếu rồi để model tự nói** (nhanh/chậm, cao/trầm, gắng giọng) — nghe tự nhiên hơn hẳn việc co giãn audio sau khi sinh. Phần nhỏ model không theo kịp được bù bằng xử lý nhẹ trên audio ra.
+
+| Trường | Mặc định | Ý nghĩa |
+|---|---|---|
+| `speed` | 1.0 | Tốc độ nói, 0.25–4 (đẹp nhất 0.7–1.5) |
+| `pitch` | 0 | Cao độ theo bán cung, −12…12 (`+3` cao hơn, `-3` trầm hơn) |
+| `volume` | 1.0 | Âm lượng, 0.1–4 (có giới hạn mềm, không vỡ tiếng) |
+| `effort` | 0 | Độ gắng giọng, 0–2: `1` nói lớn, `2` hét. Giữ to đến hết câu |
+
+Đổi giữa chừng bằng **tag trong `input`** — có hiệu lực từ chỗ tag trở đi:
+
+| Tag | Tác dụng |
+|---|---|
+| `[speed=1.3]` `[pitch=-2]` `[volume=0.7]` | đổi một giá trị |
+| `[effort=2]` hoặc `[shout=2]` | hét (vế nào cũng to như nhau) |
+| `[speed=0.85 pitch=-3]` | đổi nhiều giá trị cùng lúc |
+| `[voice=Mai Anh]` | đổi giọng |
+| `[reset]` | quay về giá trị của request |
+| `[cười]` `[thở dài]` `[hắng giọng]` | tiếng phi ngôn ngữ, như cũ |
+
+```bash
+curl -sS https://tts.falevon.com/v1/audio/speech   -H "Authorization: Bearer $VIENEU_API_KEY" -H "Content-Type: application/json"   -d '{"voice":"Hải Đăng","response_format":"wav",
+       "input":"Bình tĩnh nào. [effort=2] Anh im ngay đi! Tôi đã nói bao nhiêu lần rồi, cút ra khỏi đây! [reset] Xin lỗi, tôi hơi nóng. [speed=0.85 pitch=-2] Thôi, mình nói chuyện tử tế nhé."}'   -o gian.wav
+```
+
+```python
+# OpenAI SDK: `speed` có sẵn; pitch / volume / effort gửi qua extra_body
+with client.audio.speech.with_streaming_response.create(
+    model="vieneu-v3-turbo", voice="Mai Anh", response_format="wav", speed=1.2,
+    input="Tin vui đây! [volume=1.3] Chúng ta thắng rồi!",
+    extra_body={"pitch": 2},
+) as r:
+    r.stream_to_file("vui.wav")
+```
+
+- **Lần đầu** dùng một giọng ở một mức mới, server phải dựng giọng biến thể nên tiếng đầu tiên đến chậm hơn 2–7 s (đo trên tts.falevon.com, CPU); các lần sau dùng lại, tiếng đầu ~0.3–0.5 s như thường. Các mức được làm tròn (tốc độ 0.05, cao độ 0.5 bán cung) nên số biến thể ít.
+- Giá trị ngoài khoảng hoặc giọng không có trong tag → `400`, trước khi sinh audio.
+- **Cảm xúc khác** (vui, buồn, thì thầm…): `instructions` vẫn bị bỏ qua. Cách giống thật nhất là clone một giọng từ đoạn thu âm đúng cảm xúc đó (`POST /v1/voices`) rồi đổi bằng `[voice=…]` ở câu cần dùng.
+- Chi tiết và số đo: [docs/streaming.vi.md](docs/streaming.vi.md).
 
 📊 **[docs/streaming.vi.md](docs/streaming.vi.md)** — toàn bộ số đo trên RTX 3060 (TTFA / RTF / số luồng theo `max_streams`), dự đoán cho GPU nhỏ hơn, số đo CPU, và các lưu ý tinh chỉnh (ví dụ request đầu tiên sau khi GPU rỗi chậm thêm 100–300 ms vì GPU hạ xung).
 
