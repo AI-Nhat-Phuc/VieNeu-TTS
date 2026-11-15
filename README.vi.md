@@ -426,7 +426,7 @@ Model v3 Turbo nói theo cách giọng tham chiếu nói, nên server **biến �
 | Trường | Mặc định | Ý nghĩa |
 |---|---|---|
 | `speed` | 1.0 | Tốc độ nói, 0.25–4 (đẹp nhất 0.7–1.5) |
-| `pitch` | 0 | Cao độ theo bán cung, −12…12 (`+3` cao hơn, `-3` trầm hơn) |
+| `pitch` | 0 | Cao độ theo bán cung, −12…12 (`+3` cao hơn, `-3` trầm hơn). Vẫn là giọng của người đó, không thành người khác |
 | `volume` | 1.0 | Âm lượng, 0.1–4 (có giới hạn mềm, không vỡ tiếng) |
 | `effort` | 0 | Độ gắng giọng, 0–2: `1` nói lớn, `2` hét. Giữ to đến hết câu |
 
@@ -457,6 +457,7 @@ with client.audio.speech.with_streaming_response.create(
 ```
 
 - **Các mức phổ biến được dựng sẵn** cho mọi giọng — `effort` 1 và 2, `speed` 1.2 và 0.85, `pitch` +2 và −2 — ở nền lúc server rảnh, và lưu trên đĩa nên restart không phải dựng lại; dùng chúng thì tiếng đầu đến ngay (~0.25–0.4 s đo trên tts.falevon.com). Mức khác thì lần đầu chậm hơn ~1 s (dựng giọng biến thể; lâu hơn khi server đang bận), các lần sau như thường. Các mức được làm tròn (tốc độ 0.05, cao độ 0.5 bán cung) nên số biến thể ít. Tự chạy server thì đổi danh sách bằng `VIENEU_PREWARM` / `VIENEU_PREWARM_VOICES`.
+- Đổi cao độ giữ nguyên âm sắc (formant) và trộn một nửa dấu vân tay giọng gốc, nên giọng cao hay trầm hơn vẫn là cùng một người (độ giống giọng gốc 0.73–0.87 theo bộ nhận dạng giọng của model, trước đây 0.27–0.44). Model theo khoảng 70–80 % mức yêu cầu; server tự nâng/hạ tham chiếu mạnh hơn để bù.
 - Giá trị ngoài khoảng hoặc giọng không có trong tag → `400`, trước khi sinh audio.
 - **Cảm xúc khác** (vui, buồn, thì thầm…): `instructions` vẫn bị bỏ qua. Cách giống thật nhất là clone một giọng từ đoạn thu âm đúng cảm xúc đó (`POST /v1/voices`) rồi đổi bằng `[voice=…]` ở câu cần dùng.
 - Chi tiết và số đo: [docs/streaming.vi.md](docs/streaming.vi.md).

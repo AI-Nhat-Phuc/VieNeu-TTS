@@ -423,7 +423,7 @@ v3 Turbo speaks the way its reference voice speaks, so the server **reshapes the
 | Field | Default | Meaning |
 |---|---|---|
 | `speed` | 1.0 | Speaking rate, 0.25–4 (cleanest 0.7–1.5) |
-| `pitch` | 0 | Pitch in semitones, −12…12 (`+3` higher, `-3` lower) |
+| `pitch` | 0 | Pitch in semitones, −12…12 (`+3` higher, `-3` lower). Still the same person's voice, not someone else's |
 | `volume` | 1.0 | Loudness, 0.1–4 (soft-limited, never clips) |
 | `effort` | 0 | Vocal strain, 0–2: `1` raised voice, `2` shouting. Stays loud to the end |
 
@@ -454,6 +454,7 @@ with client.audio.speech.with_streaming_response.create(
 ```
 
 - **Common settings are built ahead** for every voice — `effort` 1 and 2, `speed` 1.2 and 0.85, `pitch` +2 and −2 — in the background while the server is idle, and kept on disk so a restart does not rebuild them; with those the first audio comes at once (~0.25–0.4 s measured on tts.falevon.com). Any other setting makes its first request ~1 s slower (building the variant; longer while the server is busy), later ones are normal. Settings are rounded (speed 0.05, pitch 0.5 semitone), so there are few variants. Self-hosting: change the list with `VIENEU_PREWARM` / `VIENEU_PREWARM_VOICES`.
+- Pitch changes keep the timbre (formants) and blend in half of the voice's own speaker embedding, so a higher or lower voice is still the same person (speaker-encoder similarity 0.73–0.87 to the plain voice, 0.27–0.44 before). The model follows ~70–80 % of the requested change; the server moves the reference further to make up for it.
 - An out-of-range value or an unknown voice in a tag → `400`, before any audio.
 - **Other emotions** (happy, sad, whispering…): `instructions` is still ignored. The most convincing way is to clone a voice from a clip spoken in that mood (`POST /v1/voices`) and switch to it with `[voice=…]`.
 - Details and measurements: [docs/streaming.md](docs/streaming.md).
