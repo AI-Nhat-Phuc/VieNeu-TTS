@@ -430,7 +430,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
         return name
 
     VARIANT_CACHE_MAX = 512   # reshaped voices kept in memory (LRU), ~20 KB each
-    VARIANT_FORMAT = 1        # bump when reshape_reference changes: old files are ignored
+    VARIANT_FORMAT = 2        # bump when reshape_reference changes: old files are ignored
 
     @staticmethod
     def _variant_dir() -> Optional[Path]:
@@ -500,7 +500,13 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 t2 = time.perf_counter()
                 emb, new_codes = self.engine.prepare_reference(src, sr=self.sample_rate, denoise=False)
             t3 = time.perf_counter()
-            out = {"speaker_emb": preset["speaker_emb"] if emb is None else np.asarray(emb, dtype=np.float32),
+            # The speaker embedding carries who is speaking; the reference codes carry
+            # how. Keep the voice's own embedding (VIENEU_VARIANT_EMB=new to take the
+            # reshaped clip's) so a pitched / strained variant stays the same person.
+            import os
+            if emb is None or os.environ.get("VIENEU_VARIANT_EMB", "keep") != "new":
+                emb = preset["speaker_emb"]
+            out = {"speaker_emb": np.asarray(emb, dtype=np.float32),
                    "codes": np.asarray(new_codes, dtype=np.int64)}
             logger.info(f"voice variant '{name}' {shape}: decode {t1 - t0:.2f}s, reshape {t2 - t1:.2f}s, "
                         f"enroll {t3 - t2:.2f}s")
