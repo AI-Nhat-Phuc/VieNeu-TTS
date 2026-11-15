@@ -4,7 +4,7 @@ The v3 Turbo model has no speed or pitch control of its own: it speaks the way
 its reference voice speaks. So the natural way ("native", the default) is to
 reshape the reference and let the model follow it; measured over 3 voices x 2
 texts it follows a sped-up reference ~83 % of the way in log-speed (x1.25 ->
-x1.23, x1.5 -> x1.40, x0.8 -> x0.85) and a pitched one ~97 % (+-3, +-6
+x1.23, x1.5 -> x1.40, x0.8 -> x0.85) and a pitched one ~72 % with the 50/50 embedding blend (+-3, +-6
 semitones). The small rest is applied to the output with the DSP below, which
 is also the whole job in "dsp" mode:
 
@@ -135,7 +135,8 @@ def has_tags(text: str) -> bool:
 # ── native mode: reshape the reference, let the model follow ────────────────
 
 K_SPEED = 0.83          # log(achieved speed) / log(reference speed), measured
-K_PITCH = 0.97          # achieved semitones / reference semitones, measured
+K_PITCH = 0.72          # achieved / reference semitones, measured with the 50/50 embedding blend
+                        # (formant-kept reference; 0.97 with the reshaped clip's own embedding)
 REF_SPEED_RANGE = (0.6, 1.7)   # beyond this the reshaped reference itself degrades
 REF_PITCH_RANGE = (-9.0, 9.0)
 

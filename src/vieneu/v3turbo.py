@@ -442,6 +442,17 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             return None
         return Path(d) if d else Path.home() / ".cache" / "vieneu" / "variants"
 
+    @staticmethod
+    def _variant_emb_mix() -> float:
+        """Share of the reshaped clip's speaker embedding in a variant (0 = the
+        voice's own: same person, pitch locked; 1 = the clip's: pitch follows,
+        another person). ``VIENEU_VARIANT_EMB_MIX``, default 0.5."""
+        import os
+        try:
+            return min(1.0, max(0.0, float(os.environ.get("VIENEU_VARIANT_EMB_MIX", "0.5"))))
+        except ValueError:
+            return 0.5
+
     def voice_variant(self, voice: Optional[str], plan: Any) -> dict:
         """``voice`` with its reference reshaped by ``plan`` (a
         ``vieneu_utils.prosody.Plan``): the codes are decoded back to audio,
@@ -462,7 +473,7 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
             raise ValueError(f"Voice '{name}' has no reference codes to reshape.")
         shape = (plan.ref_speed, plan.ref_pitch, plan.tilt_db, plan.drive, bool(getattr(plan, "head", False)))
         h = hashlib.blake2b(digest_size=16)
-        h.update(repr((self.VARIANT_FORMAT, name, shape)).encode())
+        h.update(repr((self.VARIANT_FORMAT, name, shape, self._variant_emb_mix())).encode())
         h.update(np.ascontiguousarray(np.asarray(codes, dtype=np.int64)).tobytes())
         h.update(np.ascontiguousarray(np.asarray(preset["speaker_emb"], dtype=np.float32)).tobytes())
         key = h.hexdigest()            # changes with the voice's own codes, so an edited voice rebuilds
@@ -500,12 +511,18 @@ class V3TurboVieNeuTTS(BaseVieneuTTS):
                 t2 = time.perf_counter()
                 emb, new_codes = self.engine.prepare_reference(src, sr=self.sample_rate, denoise=False)
             t3 = time.perf_counter()
-            # The speaker embedding carries who is speaking; the reference codes carry
-            # how. Keep the voice's own embedding (VIENEU_VARIANT_EMB=new to take the
-            # reshaped clip's) so a pitched / strained variant stays the same person.
-            import os
-            if emb is None or os.environ.get("VIENEU_VARIANT_EMB", "keep") != "new":
-                emb = preset["speaker_emb"]
+            # The speaker embedding carries who is speaking AND the pitch: the voice's
+            # own embedding keeps the person (cosine 0.91) but locks the pitch, the
+            # reshaped clip's follows the pitch but drifts to another person (0.6-0.7).
+            # Blend them: own * (1 - mix) + reshaped * mix, at the own one's norm.
+            mix = self._variant_emb_mix()
+            own = np.asarray(preset["speaker_emb"], dtype=np.float32)
+            if emb is not None and mix > 0:
+                new = np.asarray(emb, dtype=np.float32).reshape(own.shape)
+                b = (1 - mix) * own / (np.linalg.norm(own) + 1e-9) + mix * new / (np.linalg.norm(new) + 1e-9)
+                emb = b / (np.linalg.norm(b) + 1e-9) * np.linalg.norm(own)
+            else:
+                emb = own
             out = {"speaker_emb": np.asarray(emb, dtype=np.float32),
                    "codes": np.asarray(new_codes, dtype=np.int64)}
             logger.info(f"voice variant '{name}' {shape}: decode {t1 - t0:.2f}s, reshape {t2 - t1:.2f}s, "
