@@ -617,7 +617,8 @@ class SpeechRequest(BaseModel):
     sample_rate: int = SAMPLE_RATE
     # Bounded so one request cannot break the GPU scheduler every stream shares:
     # e.g. a huge top_k overflowed its int64 slot and NaN reached multinomial.
-    temperature: float = Field(0.8, ge=0.0, le=2.0, allow_inf_nan=False)
+    # 0.5 reads more words right than 0.8: +2 points over 72 sentences, in four runs (2026-11).
+    temperature: float = Field(0.5, ge=0.0, le=2.0, allow_inf_nan=False)
     top_k: int = Field(25, ge=1, le=1024)   # 1024 = the codec's vocabulary
     top_p: float = Field(0.95, gt=0.0, le=1.0, allow_inf_nan=False)
     repetition_penalty: float = Field(1.2, ge=1.0, le=2.0, allow_inf_nan=False)

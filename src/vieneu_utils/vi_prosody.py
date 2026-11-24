@@ -27,7 +27,7 @@ from sea_g2p import punc_norm
 # Phiên bản giọng đọc: TĂNG mỗi khi thay đổi làm audio sinh ra khác đi (chuẩn hoá
 # text, ngắt nhịp, model…). Báo ở ``/health`` để bên dùng (story-services) gộp
 # vào khoá cache và sinh lại audio đã lưu. 1 = trước khi có module này.
-VOICE_REVISION = 2
+VOICE_REVISION = 3
 
 # ─── Dấu thanh ───────────────────────────────────────────────────────────────
 

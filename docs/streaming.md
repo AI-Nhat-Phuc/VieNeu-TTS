@@ -98,7 +98,7 @@ Speed, pitch and effort are spoken by the model itself: the voice's reference is
 | `instructions` | — | Accepted for compatibility, **ignored** (`X-VieNeu-Ignored` header says so). Tone/emotion come from the voice: clone one from a sample spoken in that mood |
 
 Inline tags in `input` change them from that point on: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` The cues `[cười]` `[thở dài]` `[hắng giọng]` still work. A bad value or unknown voice in a tag → 400.
-| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.8 / 25 / 0.95 / 1.2 | Sampling; allowed 0–2 / 1–1024 / (0, 1] / 1–2, anything else (or NaN) → `400` |
+| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0.5 / 25 / 0.95 / 1.2 | Sampling; allowed 0–2 / 1–1024 / (0, 1] / 1–2, anything else (or NaN) → `400` |
 | `max_chars` | 256 | Max text chunk length, 64–512 |
 
 Response: `200` with `Transfer-Encoding: chunked`; headers `X-Request-Id`, `X-Sample-Rate`. Errors use OpenAI's shape `{"error": {"message", "type", "code"}}`: `400` bad parameter, `401` bad key, `429` no slot (with `Retry-After`).

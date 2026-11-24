@@ -350,7 +350,7 @@ def test_alias_merges_with_its_voice(noisy):
     assert _body(a) == _body(b)
 
 
-@pytest.mark.parametrize("other", [{"input": "Tạm biệt."}, {"temperature": 0.5}, {"sample_rate": 24000}])
+@pytest.mark.parametrize("other", [{"input": "Tạm biệt."}, {"temperature": 0.9}, {"sample_rate": 24000}])
 def test_different_speech_is_not_merged(noisy, other):
     a = api.speech(api.SpeechRequest(input="Xin chào."), _req())
     with pytest.raises(api.HTTPException) as e:    # the single CPU slot is A's

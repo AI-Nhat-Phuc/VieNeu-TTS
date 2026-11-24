@@ -95,7 +95,7 @@ Tốc độ, cao độ và độ gắng giọng do chính model nói ra: giọng
 | `instructions` | — | Nhận để tương thích, **bỏ qua** (header `X-VieNeu-Ignored` cho biết). Tông giọng/cảm xúc đến từ giọng tham chiếu: clone một giọng từ mẫu nói với cảm xúc đó |
 
 Tag trong `input` đổi các giá trị này từ chỗ đó trở đi: `Bình thường. [speed=1.3] Nhanh hơn. [pitch=-3 speed=0.85] Trầm và chậm. [effort=2 volume=1.5] Cút ra khỏi đây! [voice=Mai Anh] Đổi giọng. [reset] Về giá trị của request.` Các tín hiệu `[cười]` `[thở dài]` `[hắng giọng]` vẫn dùng được. Giá trị sai hoặc giọng không có trong tag → 400.
-| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,8 / 25 / 0,95 / 1,2 | Sampling; cho phép 0–2 / 1–1024 / (0, 1] / 1–2, ngoài khoảng (hoặc NaN) → `400` |
+| `temperature`, `top_k`, `top_p`, `repetition_penalty` | 0,5 / 25 / 0,95 / 1,2 | Sampling; cho phép 0–2 / 1–1024 / (0, 1] / 1–2, ngoài khoảng (hoặc NaN) → `400` |
 | `max_chars` | 256 | Độ dài chunk văn bản tối đa, 64–512 |
 
 Response: `200` với `Transfer-Encoding: chunked`; header `X-Request-Id`, `X-Sample-Rate`. Lỗi trả đúng dạng OpenAI `{"error": {"message", "type", "code"}}`: `400` tham số sai, `401` sai key, `429` hết slot (kèm `Retry-After`).
